@@ -1,0 +1,2330 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JETPAC 3D</title>
+    <!--
+      JETPAC 3D - single page version. All game code is in the <script type="module"> below.
+      three.js is loaded from a CDN (see the import map). Planet textures are in ./textures/.
+      3D version by Peter Valencic. JETPAC (c) 1983 Ultimate Play The Game / Ashby Computers & Graphics Ltd.
+    -->
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.module.js",
+          "three/examples/jsm/geometries/RoundedBoxGeometry.js": "https://cdn.jsdelivr.net/npm/three@0.187.0/examples/jsm/geometries/RoundedBoxGeometry.js"
+        }
+      }
+    </script>
+    <style>
+:root { --glow: #7df9ff; }
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: #000; overflow: hidden; color: #fff; }
+body { display: flex; align-items: center; justify-content: center; }
+/* The play field keeps the original 4:3 aspect ratio and is letterboxed in any window. */
+#stage { position: relative; width: min(100vw, 133.333vh); height: min(75vw, 100vh); overflow: hidden; background: #000; }
+canvas#game { position: absolute; inset: 0; width: 100%; height: 100%; display: block; outline: none; }
+canvas.zx { image-rendering: pixelated; image-rendering: crisp-edges; display: block; max-width: 100%; }
+#ui { position: absolute; inset: 0; pointer-events: none; }
+#hud { position: absolute; top: 0; left: 0; right: 0; display: grid; grid-template-columns: 1fr auto 1fr; padding: 1.6% 2.4%; filter: drop-shadow(0 0 6px rgba(125,249,255,.55)); }
+#hud .mid canvas { margin: 0 auto; }
+#hud .right canvas { margin-left: auto; }
+#banner { position: absolute; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center; gap: 2.2vmin; text-align: center; background: radial-gradient(ellipse at center, rgba(2,2,10,.25), rgba(2,2,10,.72)); }
+#banner.visible { display: flex; }
+#banner .banner-title { filter: drop-shadow(0 0 22px var(--glow)) drop-shadow(0 0 60px #ff00ff); }
+#banner .banner-prompt { animation: blink 1.1s steps(2, start) infinite; }
+#banner .banner-keys-box { display: flex; flex-direction: column; gap: 1.2vmin; margin-top: 3vmin; align-items: center; }
+#toast { position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); opacity: 0; transition: opacity .3s; }
+@keyframes blink { to { visibility: hidden; } }
+
+    </style>
+  </head>
+  <body>
+    <div id="stage">
+      <canvas id="game"></canvas>
+      <div id="ui"></div>
+    </div>
+    <script type="module">
+// src/game/constants.ts
+var SCREEN_W = 256;
+var SCREEN_H = 192;
+var STEP = 1 / 120;
+var PLATFORMS = [
+  { attr: 4, x: 128, y: 96, w: 27 },
+  // middle
+  { attr: 6, x: 120, y: 184, w: 136 },
+  // bottom (ground)
+  { attr: 4, x: 48, y: 72, w: 35 },
+  // left
+  { attr: 4, x: 208, y: 48, w: 35 }
+  // right
+];
+function platformRect(p) {
+  const left = p.x - (p.w & 252) + 16;
+  const tiles = (p.w >> 2) - 2;
+  return { x: left, y: p.y, w: tiles * 8, h: 8, tiles };
+}
+var JETMAN_START = { x: 128, y: 184 };
+var ROCKET_X = 168;
+var ROCKET_Y = 184;
+var TOP_MODULE_START = { x: 48, y: 72 };
+var MID_MODULE_START = { x: 128, y: 96 };
+var DROP_COLUMNS = [
+  8,
+  32,
+  40,
+  48,
+  56,
+  64,
+  88,
+  96,
+  120,
+  128,
+  136,
+  192,
+  224,
+  8,
+  88,
+  96
+];
+var SPAWN_GRACE = 1;
+var START_LIVES = 4;
+var LEVEL_ALIENS = [
+  "meteor",
+  "squidgy",
+  "sphere",
+  "jetFighter",
+  "ufo",
+  "crossShip",
+  "spaceCraft",
+  "frog"
+];
+var ALIEN_POINTS = {
+  meteor: 25,
+  squidgy: 80,
+  sphere: 40,
+  jetFighter: 55,
+  ufo: 50,
+  crossShip: 60,
+  spaceCraft: 25,
+  frog: 50
+};
+var SPECTRUM_BRIGHT = [
+  0,
+  255,
+  16711680,
+  16711935,
+  65280,
+  65535,
+  16776960,
+  16777215
+];
+
+// src/game/geometry.ts
+var wrapX = (x) => (x % SCREEN_W + SCREEN_W) % SCREEN_W;
+function wrapDelta(a, b) {
+  return ((b - a + SCREEN_W / 2) % SCREEN_W + SCREEN_W) % SCREEN_W - SCREEN_W / 2;
+}
+function overlaps(a, b) {
+  return a.l < b.r && a.r > b.l && a.t < b.b && a.b > b.t;
+}
+var PLATFORM_BOXES = PLATFORMS.flatMap((p) => {
+  const r = platformRect(p);
+  return [-SCREEN_W, 0, SCREEN_W].map((off) => ({
+    l: r.x + off,
+    r: r.x + r.w + off,
+    t: r.y,
+    b: r.y + r.h,
+    top: r.y
+  }));
+});
+function firstPlatformHit(box) {
+  for (const p of PLATFORM_BOXES) if (overlaps(box, p)) return p;
+  return null;
+}
+function penetration(box, p) {
+  const fromTop = box.b - p.t;
+  const fromBottom = p.b - box.t;
+  const fromLeft = box.r - p.l;
+  const fromRight = p.r - box.l;
+  const min = Math.min(fromTop, fromBottom, fromLeft, fromRight);
+  if (min === fromTop) return { contact: "top", push: -fromTop };
+  if (min === fromBottom) return { contact: "bottom", push: fromBottom };
+  if (min === fromLeft) return { contact: "left", push: -fromLeft };
+  return { contact: "right", push: fromRight };
+}
+
+// src/game/Game.ts
+var ALIEN_SLOT_COLOURS = [4, 5, 2, 3, 4, 5];
+var ALIEN_H = {
+  meteor: 11,
+  squidgy: 14,
+  sphere: 16,
+  jetFighter: 7,
+  ufo: 8,
+  crossShip: 15,
+  spaceCraft: 14,
+  frog: 14
+};
+var TUNING = {
+  jetman: {
+    accelX: 620,
+    dragX: 330,
+    maxX: 105,
+    gravity: 520,
+    thrust: 1150,
+    maxUp: 118,
+    maxDown: 112,
+    walk: 62,
+    top: 42,
+    // highest feet position (keeps Jetman under the score line)
+    boxL: 3,
+    boxR: 13,
+    boxH: 23
+  },
+  alienSpeed: 100,
+  chaseSpeed: 95,
+  chaseAccel: 170,
+  laserSpeed: 420,
+  laserMinInterval: 0.08,
+  itemFall: 100,
+  rocketSpeed: 50,
+  deathDelay: 1.1
+};
+var rnd = (a, b) => a + Math.random() * (b - a);
+var Game = class {
+  phase = "title";
+  /** Seconds of play. */
+  time = 0;
+  level = 0;
+  lives = 0;
+  score = 0;
+  hiScore = 0;
+  /** Seconds left of the post-respawn grace period (no new aliens). */
+  beginDelay = 0;
+  gameOverTimer = 0;
+  deathTimer = 0;
+  jetman = this.newJetman();
+  rocket = this.newRocket();
+  /** Slot 1: top rocket module at level start, fuel pods afterwards. */
+  pod = null;
+  /** Slot 2: middle rocket module at level start, collectibles afterwards. */
+  item = null;
+  aliens = [null, null, null, null, null, null];
+  lasers = [];
+  booms = [];
+  /** Debug/test switch: stop new aliens from spawning. */
+  aliensEnabled = true;
+  onSfx = () => {
+  };
+  fireCooldown = 0;
+  spawnCooldown = 0;
+  collectibleClock = 0;
+  sfxType = 0;
+  // 0 none, 12 enemy death, 13 Jetman/sphere death
+  sfxDur = 0;
+  sfxClock = 0;
+  thrusterClock = 0;
+  /** 50Hz style counters for the renderer's blinking/flashing. */
+  get tick() {
+    return Math.floor(this.time * 50);
+  }
+  get timer() {
+    return this.tick;
+  }
+  // --------------------------------------------------------------------- setup
+  newJetman() {
+    return {
+      mode: "none",
+      active: false,
+      x: JETMAN_START.x,
+      y: JETMAN_START.y,
+      px: JETMAN_START.x,
+      py: JETMAN_START.y,
+      vx: 0,
+      vy: 0,
+      faceLeft: false,
+      thrusting: false
+    };
+  }
+  newRocket() {
+    return {
+      x: ROCKET_X,
+      y: ROCKET_Y,
+      px: ROCKET_X,
+      py: ROCKET_Y,
+      state: "pad",
+      modules: 1,
+      fuel: 0,
+      model: 0
+    };
+  }
+  newItem(kind, x, y, sprite = 0) {
+    return { kind, x, y, px: x, py: y, sprite, locked: kind === "top", carried: false, delivering: false };
+  }
+  startGame() {
+    this.phase = "playing";
+    this.level = 0;
+    this.lives = START_LIVES;
+    this.score = 0;
+    this.time = 0;
+    this.aliens = [null, null, null, null, null, null];
+    this.lasers = [];
+    this.booms = [];
+    this.collectibleClock = 0;
+    this.deathTimer = 0;
+    this.resetRocketLevel();
+    this.playerInit();
+  }
+  /** New rocket plus the two modules lying on the platforms. */
+  resetRocketLevel() {
+    this.rocket = this.newRocket();
+    this.rocket.model = this.level >> 2 & 3;
+    this.pod = this.newItem("top", TOP_MODULE_START.x, TOP_MODULE_START.y);
+    this.item = this.newItem("mid", MID_MODULE_START.x, MID_MODULE_START.y);
+  }
+  playerInit() {
+    this.jetman = this.newJetman();
+    this.jetman.mode = "fly";
+    this.jetman.active = true;
+    this.beginDelay = SPAWN_GRACE;
+    this.lives--;
+    this.sfx({ t: "square", d: 48, c: 64, silentStart: false });
+  }
+  // ------------------------------------------------------------------- helpers
+  sfx(e) {
+    this.onSfx(e);
+  }
+  addScore(points) {
+    this.score += points;
+    if (this.score > this.hiScore) this.hiScore = this.score;
+  }
+  get jetmanLive() {
+    return this.jetman.mode !== "none" && this.jetman.active;
+  }
+  get carrying() {
+    for (const it of [this.pod, this.item]) if (it && it.carried && !it.delivering) return it;
+    return null;
+  }
+  jetmanBox() {
+    const j = this.jetman;
+    const t = TUNING.jetman;
+    return { l: j.x + t.boxL, r: j.x + t.boxR, t: j.y - t.boxH, b: j.y };
+  }
+  alienBox(a) {
+    return { l: a.x + 1, r: a.x + 15, t: a.y - ALIEN_H[a.kind], b: a.y };
+  }
+  itemBox(it) {
+    const h = it.kind === "top" || it.kind === "mid" ? 16 : it.kind === "pod" ? 11 : 12;
+    return { l: it.x + 2, r: it.x + 14, t: it.y - h, b: it.y };
+  }
+  // ---------------------------------------------------------------------- step
+  /** Advance the simulation by one fixed step (STEP seconds). */
+  update(input) {
+    if (this.phase === "gameover") {
+      this.gameOverTimer -= STEP;
+      if (this.gameOverTimer <= 0) this.phase = "title";
+      return;
+    }
+    if (this.phase !== "playing") return;
+    this.time += STEP;
+    this.snapshot();
+    this.updateJetman(input);
+    this.updateLasers();
+    this.updateRocket();
+    this.updateItem(this.pod, "pod");
+    this.updateItem(this.item, "item");
+    this.updateAliens();
+    this.updateSfxObject();
+    this.updateBooms();
+    this.updateDeath();
+    this.spawn();
+  }
+  snapshot() {
+    const bodies = [this.jetman, this.rocket, this.pod, this.item, ...this.aliens];
+    for (const b of bodies) {
+      if (b) {
+        b.px = b.x;
+        b.py = b.y;
+      }
+    }
+    for (const l of this.lasers) l.px = l.head;
+  }
+  // -------------------------------------------------------------------- Jetman
+  updateJetman(input) {
+    const j = this.jetman;
+    if (j.mode === "none") return;
+    if (this.beginDelay > 0) this.beginDelay -= STEP;
+    this.fireCooldown -= STEP;
+    const T = TUNING.jetman;
+    const dir = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+    if (dir) j.faceLeft = dir < 0;
+    if (j.mode === "fly") {
+      j.thrusting = input.thrust;
+      if (dir) j.vx += dir * T.accelX * STEP;
+      else if (Math.abs(j.vx) <= T.dragX * STEP) j.vx = 0;
+      else j.vx -= Math.sign(j.vx) * T.dragX * STEP;
+      j.vx = Math.max(-T.maxX, Math.min(T.maxX, j.vx));
+      j.vy += (input.thrust ? -T.thrust : T.gravity) * STEP;
+      j.vy = Math.max(-T.maxUp, Math.min(T.maxDown, j.vy));
+      j.x = wrapX(j.x + j.vx * STEP);
+      this.resolveJetmanX();
+      const prevFeet = j.y;
+      j.y += j.vy * STEP;
+      if (j.y < T.top) {
+        j.y = T.top;
+        if (j.vy < 0) j.vy = -j.vy * 0.3;
+      }
+      this.resolveJetmanY(prevFeet);
+    } else {
+      j.thrusting = false;
+      j.vx = dir * T.walk;
+      j.vy = 0;
+      j.x = wrapX(j.x + j.vx * STEP);
+      this.resolveJetmanX();
+      if (input.thrust) {
+        j.mode = "fly";
+        j.vy = -45;
+        j.y -= 0.5;
+      } else if (!this.hasSupport()) {
+        j.mode = "fly";
+        j.vy = 0;
+      }
+    }
+    if (this.jetman.mode !== "none" && input.fire && this.fireCooldown <= 0) this.fireLaser();
+  }
+  hasSupport() {
+    const b = this.jetmanBox();
+    for (const p of PLATFORM_BOXES) {
+      if (Math.abs(b.b - p.top) < 0.75 && b.r > p.l && b.l < p.r) return true;
+    }
+    return false;
+  }
+  /** Stop Jetman walking/flying sideways into a platform. */
+  resolveJetmanX() {
+    const j = this.jetman;
+    const T = TUNING.jetman;
+    const b = this.jetmanBox();
+    const p = firstPlatformHit({ ...b, b: b.b - 0.05 });
+    if (!p) return;
+    const pen = penetration(b, p);
+    if (pen.contact === "left" || pen.contact === "right") {
+      j.x = wrapX(j.x + pen.push);
+      j.vx = -j.vx * 0.35;
+      void T;
+    }
+  }
+  resolveJetmanY(prevFeet) {
+    const j = this.jetman;
+    const T = TUNING.jetman;
+    const b = this.jetmanBox();
+    const p = firstPlatformHit(b);
+    if (!p) return;
+    if (j.vy >= 0 && prevFeet <= p.top + 0.5) {
+      j.y = p.top;
+      j.vy = 0;
+      j.vx = 0;
+      j.mode = "walk";
+    } else if (j.vy < 0) {
+      j.y = p.b + T.boxH + 0.01;
+      j.vy = Math.abs(j.vy) * 0.25 + 10;
+    } else {
+      const pen = penetration(b, p);
+      if (pen.contact === "left" || pen.contact === "right") j.x = wrapX(j.x + pen.push);
+      else j.y += pen.push;
+    }
+  }
+  // -------------------------------------------------------------------- lasers
+  fireLaser() {
+    if (this.lasers.length >= 4) return;
+    const j = this.jetman;
+    const dir = j.faceLeft ? -1 : 1;
+    const start = dir === 1 ? j.x + 18 : j.x - 2;
+    const colours = [7, 3, 3, 5];
+    this.fireCooldown = TUNING.laserMinInterval;
+    this.lasers.push({
+      y: j.y - 13,
+      dir,
+      head: start,
+      tail: start,
+      range: (16 + Math.floor(Math.random() * 8)) * 8,
+      px: start,
+      colour: colours[Math.floor(Math.random() * 4)]
+    });
+    this.sfx({ t: "laser" });
+  }
+  updateLasers() {
+    for (const l of this.lasers) {
+      if (l.range > 0) {
+        const move = Math.min(l.range, TUNING.laserSpeed * STEP);
+        const next = l.head + move * l.dir;
+        const hit = firstPlatformHit({ l: wrapX(next) - 1, r: wrapX(next) + 1, t: l.y - 1, b: l.y + 1 });
+        if (hit) l.range = 0;
+        else {
+          l.head = next;
+          l.range -= move;
+        }
+      }
+      const gap = (l.head - l.tail) * l.dir;
+      if (l.range <= 0 || gap >= 32) l.tail += Math.min(gap, TUNING.laserSpeed * STEP) * l.dir;
+    }
+    this.lasers = this.lasers.filter((l) => (l.head - l.tail) * l.dir > 0.01 || l.range > 0);
+  }
+  laserHits(a) {
+    const box = this.alienBox(a);
+    for (const l of this.lasers) {
+      if (l.y < box.t - 3 || l.y > box.b + 3) continue;
+      const lo = Math.min(l.head, l.tail);
+      const hi = Math.max(l.head, l.tail);
+      for (const off of [-SCREEN_W, 0, SCREEN_W]) {
+        if (hi + off >= box.l && lo + off <= box.r) {
+          l.range = 0;
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  // --------------------------------------------------------------------- death
+  killJetman() {
+    const j = this.jetman;
+    if (j.mode === "none") return;
+    this.booms.push({ x: j.x, y: j.y, age: 0, big: true, colour: 7 });
+    j.mode = "none";
+    j.active = false;
+    this.deathTimer = TUNING.deathDelay;
+    for (const it of [this.pod, this.item]) {
+      if (it && it.carried && !it.delivering) it.carried = false;
+    }
+  }
+  updateDeath() {
+    if (this.deathTimer > 0) {
+      this.deathTimer -= STEP;
+      if (this.deathTimer <= 0) this.playerTurnEnds();
+    }
+  }
+  playerTurnEnds() {
+    this.aliens = [null, null, null, null, null, null];
+    this.lasers = [];
+    if (this.lives <= 0) {
+      this.phase = "gameover";
+      this.gameOverTimer = 4;
+      return;
+    }
+    this.playerInit();
+  }
+  // ----------------------------------------------------------------------- sfx
+  setExplosion(type) {
+    this.sfxType = type;
+    this.sfxDur = 4;
+    this.sfxClock = 0;
+  }
+  /** The original plays the explosion as three short descending sweeps, one per tick. */
+  updateSfxObject() {
+    if (!this.sfxType) return;
+    this.sfxClock -= STEP;
+    if (this.sfxClock > 0) return;
+    this.sfxClock += 0.02;
+    if (--this.sfxDur === 0) {
+      this.sfxType = 0;
+      return;
+    }
+    const c = this.sfxType === 13 ? 16 : this.sfxDur + 24;
+    this.sfx({ t: "explode", c });
+  }
+  thrusterSfx(y) {
+    this.thrusterClock -= STEP;
+    if (this.thrusterClock > 0) return;
+    this.thrusterClock += 0.02;
+    const yy = Math.floor(y);
+    const d = (yy >> 4 | yy << 4) & 127 | 64;
+    this.sfx({ t: "square", d, c: 16, silentStart: true });
+  }
+  // -------------------------------------------------------------------- rocket
+  updateRocket() {
+    const r = this.rocket;
+    if (r.state === "pad") {
+      if (r.fuel >= 6 && this.jetmanLive) {
+        const box = { l: r.x, r: r.x + 16, t: r.y - 16 * r.modules, b: r.y };
+        const jb = this.jetmanBox();
+        if (overlaps({ l: jb.l - 2, r: jb.r + 2, t: jb.t - 2, b: jb.b + 2 }, box)) {
+          r.state = "up";
+          this.jetman.mode = "none";
+          this.jetman.active = false;
+          this.lives++;
+        }
+      }
+    } else if (r.state === "up") {
+      r.y -= TUNING.rocketSpeed * STEP;
+      this.thrusterSfx(r.y);
+      if (r.y < 40) this.nextLevel();
+    } else {
+      r.y += TUNING.rocketSpeed * STEP;
+      this.thrusterSfx(r.y);
+      if (r.y >= ROCKET_Y) {
+        r.y = ROCKET_Y;
+        r.state = "pad";
+        this.playerInit();
+      }
+    }
+  }
+  nextLevel() {
+    this.level++;
+    this.aliens = [null, null, null, null, null, null];
+    this.lasers = [];
+    this.pod = null;
+    this.item = null;
+    this.rocket.fuel = 0;
+    this.rocket.state = "down";
+    this.rocket.py = this.rocket.y;
+    if ((this.level & 3) === 0) {
+      this.resetRocketLevel();
+      this.lives++;
+      this.playerInit();
+    }
+  }
+  // --------------------------------------------------------------------- items
+  /** Fall straight down and stop on the first platform surface. */
+  fall(it, speed) {
+    const box = this.itemBox(it);
+    const prev = it.y;
+    const next = it.y + speed * STEP;
+    for (const p of PLATFORM_BOXES) {
+      if (box.r > p.l && box.l < p.r && prev <= p.top + 0.01 && next >= p.top) {
+        it.y = p.top;
+        return;
+      }
+    }
+    it.y = next;
+  }
+  updateItem(it, slot) {
+    if (!it) return;
+    const j = this.jetman;
+    const r = this.rocket;
+    const remove = () => {
+      if (slot === "pod") this.pod = null;
+      else this.item = null;
+    };
+    if (it.kind === "collectible") {
+      this.fall(it, TUNING.itemFall);
+      if (this.jetmanLive && overlaps(this.jetmanBox(), this.itemBox(it))) {
+        this.addScore(250);
+        this.sfx({ t: "square", d: 48, c: 64, silentStart: false });
+        remove();
+      }
+      return;
+    }
+    if (it.delivering) {
+      if (it.kind === "pod") {
+        if (it.y >= r.y - 7) {
+          r.fuel++;
+          this.sfx({ t: "square", d: 32, c: 80, silentStart: true });
+          remove();
+        } else it.y += TUNING.itemFall * STEP;
+      } else {
+        const target = r.y - 16 * r.modules;
+        if (it.y >= target) {
+          r.modules++;
+          this.sfx({ t: "square", d: 32, c: 80, silentStart: true });
+          if (this.pod && this.pod.kind === "top") this.pod.locked = false;
+          remove();
+        } else it.y += TUNING.itemFall * STEP;
+      }
+      return;
+    }
+    if (it.carried) {
+      it.x = j.x;
+      it.y = j.y;
+      if (Math.abs(wrapDelta(r.x, it.x)) < 8) {
+        it.delivering = true;
+        it.x = r.x;
+      }
+      return;
+    }
+    if (it.locked) return;
+    if (this.jetmanLive && !this.carrying) {
+      const b = this.itemBox(it);
+      const grow = { l: b.l - 2, r: b.r + 2, t: b.t - 2, b: b.b + 2 };
+      if (overlaps(this.jetmanBox(), grow)) {
+        it.carried = true;
+        this.addScore(100);
+        this.sfx({ t: "square", d: 80, c: 40, silentStart: true });
+        return;
+      }
+    }
+    this.fall(it, TUNING.itemFall);
+  }
+  // -------------------------------------------------------------------- aliens
+  killAlien(a, points, sfx) {
+    if (points) this.addScore(points);
+    a.exploding = true;
+    a.expTimer = 0.12;
+    this.booms.push({ x: a.x, y: a.y, age: 0, big: false, colour: a.colour });
+    if (sfx === "one") this.setExplosion(12);
+    else if (sfx === "two") this.setExplosion(13);
+    else this.thrusterSfx(a.y);
+  }
+  collideAlien(a) {
+    a.exploding = true;
+    a.expTimer = 0.12;
+    this.booms.push({ x: a.x, y: a.y, age: 0, big: false, colour: a.colour });
+    this.setExplosion(13);
+    this.killJetman();
+  }
+  updateAliens() {
+    for (const a of this.aliens) {
+      if (!a) continue;
+      a.age += STEP;
+      if (a.exploding) {
+        a.expTimer -= STEP;
+        if (a.expTimer <= 0) this.aliens[a.slot] = null;
+        continue;
+      }
+      switch (a.kind) {
+        case "meteor":
+        case "spaceCraft":
+          this.updateMeteor(a);
+          break;
+        case "squidgy":
+          this.updateWanderer(a, "one", 0);
+          break;
+        case "sphere":
+          this.updateWanderer(a, "two", 1);
+          break;
+        case "jetFighter":
+          this.updateJetFighter(a);
+          break;
+        case "ufo":
+        case "frog":
+          this.updateChaser(a);
+          break;
+        case "crossShip":
+          this.updateCrossShip(a);
+          break;
+      }
+    }
+  }
+  hitsJetman(a) {
+    if (!this.jetmanLive) return false;
+    const b = this.alienBox(a);
+    return overlaps(this.jetmanBox(), { l: b.l + 1, r: b.r - 1, t: b.t + 1, b: b.b - 1 });
+  }
+  /** Move and push out of platforms; returns the contact side, if any. */
+  slide(a) {
+    a.x = wrapX(a.x + a.vx * STEP);
+    a.y += a.vy * STEP;
+    const b = this.alienBox(a);
+    const p = firstPlatformHit(b);
+    if (!p) return null;
+    const pen = penetration(b, p);
+    if (pen.contact === "top" || pen.contact === "bottom") a.y += pen.push;
+    else a.x = wrapX(a.x + pen.push);
+    return pen.contact;
+  }
+  updateMeteor(a) {
+    a.x = wrapX(a.x + a.vx * STEP);
+    a.y += a.vy * STEP;
+    if (firstPlatformHit(this.alienBox(a))) return this.killAlien(a, 0, "one");
+    if (this.laserHits(a)) return this.killAlien(a, ALIEN_POINTS[a.kind], "one");
+    if (this.hitsJetman(a)) this.collideAlien(a);
+  }
+  /** Squidgy alien (bounces diagonally) and sphere alien (horizontal with random vertical bursts). */
+  updateWanderer(a, sfx, sphere) {
+    if (this.laserHits(a)) return this.killAlien(a, ALIEN_POINTS[a.kind], sfx);
+    if (this.hitsJetman(a)) return this.collideAlien(a);
+    const speed = TUNING.alienSpeed;
+    if (sphere) {
+      a.timer -= STEP;
+      if (a.timer <= 0) {
+        if (a.vy === 0) {
+          if (Math.random() < 3 * STEP) {
+            a.vy = Math.random() < 0.5 ? -speed : speed;
+            a.timer = rnd(0.35, 0.95);
+          } else a.timer = 0;
+        } else {
+          a.vy = 0;
+          a.timer = 0;
+        }
+      }
+    }
+    const contact = this.slide(a);
+    if (contact === "top") a.vy = -Math.abs(a.vy || speed);
+    else if (contact === "bottom") a.vy = Math.abs(a.vy || speed);
+    else if (contact === "left") a.vx = -Math.abs(a.vx);
+    else if (contact === "right") a.vx = Math.abs(a.vx);
+    if (a.y < 40) {
+      a.y = 40;
+      if (a.vy < 0) a.vy = -a.vy;
+    }
+    a.left = a.vx < 0;
+  }
+  updateJetFighter(a) {
+    const j = this.jetman;
+    const die = () => this.killAlien(a, ALIEN_POINTS.jetFighter, "thruster");
+    if (!a.charging) {
+      const level = Math.abs(a.y - (j.y - 12)) < 3;
+      if (this.jetmanLive && level || Math.random() < 1.5 * STEP) {
+        a.charging = true;
+        a.timer = rnd(32, 127) * 0.04;
+        a.colour = 7;
+        a.vx = a.left ? -TUNING.alienSpeed : TUNING.alienSpeed;
+      } else {
+        a.vy = Math.floor(this.time / 1.28) % 2 === 0 ? 50 : -50;
+        a.vx = 0;
+      }
+    }
+    if (a.charging) {
+      a.timer -= STEP;
+      if (a.timer <= 0) return die();
+      a.vy = j.y - 12 < a.y ? -50 : 50;
+    }
+    a.x = wrapX(a.x + a.vx * STEP);
+    a.y += a.vy * STEP;
+    if (a.y < 40) return die();
+    if (firstPlatformHit(this.alienBox(a))) return die();
+    if (this.laserHits(a)) return die();
+    if (this.hitsJetman(a)) this.collideAlien(a);
+  }
+  /** UFO and frog: accelerate towards Jetman, bouncing off platforms. */
+  updateChaser(a) {
+    if (this.laserHits(a)) return this.killAlien(a, ALIEN_POINTS[a.kind], "one");
+    if (this.hitsJetman(a)) return this.collideAlien(a);
+    const j = this.jetman;
+    if (this.jetmanLive) {
+      const tx = wrapDelta(a.x + 8, j.x + 8);
+      const ty = j.y - 11 - (a.y - ALIEN_H[a.kind] / 2);
+      const len = Math.hypot(tx, ty) || 1;
+      const desiredX = tx / len * TUNING.chaseSpeed;
+      const desiredY = ty / len * TUNING.chaseSpeed;
+      const dvx = desiredX - a.vx;
+      const dvy = desiredY - a.vy;
+      const dl = Math.hypot(dvx, dvy) || 1;
+      const step = Math.min(dl, TUNING.chaseAccel * STEP);
+      a.vx += dvx / dl * step;
+      a.vy += dvy / dl * step;
+    }
+    const contact = this.slide(a);
+    if (contact === "top") a.vy = -Math.abs(a.vy) * 0.6 - 10;
+    else if (contact === "bottom") a.vy = Math.abs(a.vy) * 0.6 + 10;
+    else if (contact === "left") a.vx = -Math.abs(a.vx) * 0.6 - 10;
+    else if (contact === "right") a.vx = Math.abs(a.vx) * 0.6 + 10;
+    if (a.y < 40) {
+      a.y = 40;
+      if (a.vy < 0) a.vy = 0;
+    }
+    a.left = a.vx < 0;
+  }
+  /** Crossed ship: drifts sideways and bounces like a ball. */
+  updateCrossShip(a) {
+    if (this.laserHits(a)) return this.killAlien(a, ALIEN_POINTS.crossShip, "two");
+    if (this.hitsJetman(a)) return this.collideAlien(a);
+    a.vy += 40 * STEP;
+    const contact = this.slide(a);
+    if (contact === "top") a.vy = -rnd(45, 115);
+    else if (contact === "bottom") a.vy = Math.abs(a.vy);
+    else if (contact === "left") a.vx = -Math.abs(a.vx);
+    else if (contact === "right") a.vx = Math.abs(a.vx);
+    if (a.y < 40) {
+      a.y = 40;
+      a.vy = Math.abs(a.vy);
+    }
+    a.left = a.vx < 0;
+  }
+  // ------------------------------------------------------------------- effects
+  updateBooms() {
+    for (const b of this.booms) b.age += STEP;
+    this.booms = this.booms.filter((b) => b.age < (b.big ? 1.2 : 0.6));
+  }
+  // --------------------------------------------------------------------- spawn
+  liveAlienCount() {
+    return this.aliens.filter(Boolean).length;
+  }
+  /** Drop aliens, fuel pods and collectibles. */
+  spawn() {
+    const j = this.jetman;
+    const inPlay = j.mode !== "none";
+    if (!inPlay) return;
+    this.spawnCooldown -= STEP;
+    const count = this.liveAlienCount();
+    if (this.aliensEnabled && this.beginDelay <= 0 && this.rocket.state === "pad") {
+      if (count < 3 && this.spawnCooldown <= 0) {
+        this.spawnAlien();
+        this.spawnCooldown = 0.35;
+      } else if (count < 6 && Math.random() < 1.3 * STEP) {
+        this.spawnAlien();
+      }
+    }
+    if (this.rocket.state !== "pad") return;
+    if (!this.pod && this.rocket.fuel < 6 && Math.random() < 3 * STEP) {
+      this.pod = this.newItem("pod", DROP_COLUMNS[Math.floor(Math.random() * 16)], 32);
+    }
+    this.collectibleClock += STEP;
+    if (!this.item && this.collectibleClock >= 2.56) {
+      this.collectibleClock = 0;
+      let sprite = Math.floor(Math.random() * 8) * 2;
+      if (sprite & 8) sprite &= 8;
+      this.item = this.newItem("collectible", DROP_COLUMNS[Math.floor(Math.random() * 16)], 32, sprite & 14 | 32);
+    }
+  }
+  spawnAlien() {
+    const slot = this.aliens.findIndex((a2) => a2 === null);
+    if (slot < 0) return;
+    const kind = LEVEL_ALIENS[this.level & 7];
+    const colour = ALIEN_SLOT_COLOURS[slot];
+    const left = Math.random() < 0.5;
+    const speed = TUNING.alienSpeed;
+    const a = {
+      kind,
+      slot,
+      colour,
+      x: 0,
+      y: 40 + Math.floor(Math.random() * 128),
+      px: 0,
+      py: 0,
+      vx: left ? -speed : speed,
+      vy: 0,
+      left,
+      exploding: false,
+      expTimer: 0,
+      age: 0,
+      timer: 0,
+      charging: false
+    };
+    if (kind === "meteor" || kind === "spaceCraft") a.vy = (colour & 1) * 25;
+    if (kind === "squidgy") a.vy = -speed;
+    if (kind === "jetFighter") a.vx = 0;
+    if (kind === "ufo" || kind === "frog") {
+      a.vx = left ? -40 : 40;
+      a.vy = 0;
+    }
+    a.px = a.x;
+    a.py = a.y;
+    this.aliens[slot] = a;
+  }
+};
+
+// src/input.ts
+var LEFT = ["ArrowLeft", "KeyA", "KeyZ", "KeyJ", "Numpad4"];
+var RIGHT = ["ArrowRight", "KeyD", "KeyX", "KeyL", "Numpad6"];
+var THRUST = ["ArrowUp", "KeyW", "KeyQ", "KeyI", "Numpad8"];
+var FIRE = ["Space", "KeyF", "KeyG", "KeyH", "ArrowDown", "ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight", "Numpad0"];
+var BLOCK = /* @__PURE__ */ new Set([...LEFT, ...RIGHT, ...THRUST, ...FIRE, "Enter"]);
+var Keyboard = class {
+  down = /* @__PURE__ */ new Set();
+  pressed = /* @__PURE__ */ new Set();
+  /** Keys pressed since the last game tick, so a quick tap still counts for one tick. */
+  latched = /* @__PURE__ */ new Set();
+  constructor() {
+    const opts = { capture: true };
+    window.addEventListener(
+      "keydown",
+      (e) => {
+        if (BLOCK.has(e.code)) e.preventDefault();
+        if (!this.down.has(e.code)) {
+          this.pressed.add(e.code);
+          this.latched.add(e.code);
+        }
+        this.down.add(e.code);
+      },
+      opts
+    );
+    window.addEventListener("keyup", (e) => this.down.delete(e.code), opts);
+    window.addEventListener("blur", () => this.down.clear());
+    document.addEventListener("visibilitychange", () => this.down.clear());
+  }
+  any(codes, latched = false) {
+    return codes.some((c) => this.down.has(c) || latched && this.latched.has(c));
+  }
+  /** Input for one game tick (held keys plus any tap that happened since the last tick). */
+  sample() {
+    const input = {
+      left: this.any(LEFT, true),
+      right: this.any(RIGHT, true),
+      thrust: this.any(THRUST, true),
+      fire: this.any(FIRE, true)
+    };
+    this.latched.clear();
+    return input;
+  }
+  /** True once per key press. */
+  consume(...codes) {
+    let hit = false;
+    for (const c of codes) if (this.pressed.delete(c)) hit = true;
+    return hit;
+  }
+  endFrame() {
+    this.pressed.clear();
+  }
+};
+
+// src/render/GameView.ts
+import * as THREE4 from "three";
+import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
+
+// src/data/sprites.json
+var sprites_default = { jetman: { fly_right: [{ off: 0, w: 2, h: 24, rows: [[7, 128], [14, 0], [45, 224], [46, 224], [46, 224], [103, 192], [96, 0], [87, 128], [116, 208], [84, 208], [116, 62], [91, 192], [123, 128], [61, 248], [41, 248], [84, 24], [124, 0], [0, 28], [80, 30], [56, 0], [68, 0], [216, 0], [32, 0], [16, 0]], x0: 0 }, { off: 0, w: 3, h: 24, rows: [[1, 224, 0], [3, 128, 0], [11, 120, 0], [11, 184, 0], [11, 184, 0], [25, 240, 0], [24, 0, 0], [21, 224, 0], [29, 52, 0], [21, 52, 0], [29, 15, 128], [22, 240, 0], [30, 224, 0], [15, 126, 0], [10, 126, 0], [21, 6, 0], [31, 0, 0], [0, 7, 0], [21, 7, 128], [8, 128, 0], [10, 0, 0], [5, 0, 0], [80, 0, 0], [10, 0, 0]], x0: -2 }, { off: 0, w: 3, h: 24, rows: [[0, 120, 0], [0, 224, 0], [2, 222, 0], [2, 238, 0], [2, 238, 0], [6, 124, 0], [6, 0, 0], [5, 120, 0], [7, 77, 0], [5, 77, 0], [7, 67, 224], [5, 188, 0], [7, 184, 0], [3, 223, 128], [2, 159, 128], [5, 65, 128], [7, 192, 0], [0, 1, 192], [6, 193, 224], [0, 128, 0], [6, 0, 0], [16, 128, 0], [4, 0, 0], [1, 0, 0]], x0: -4 }, { off: 0, w: 3, h: 24, rows: [[0, 30, 0], [0, 56, 0], [0, 183, 128], [0, 187, 128], [0, 187, 128], [1, 159, 0], [1, 128, 0], [1, 94, 0], [1, 211, 64], [1, 83, 64], [1, 208, 248], [1, 111, 0], [1, 238, 0], [0, 247, 224], [0, 167, 224], [1, 80, 96], [1, 240, 0], [0, 0, 112], [2, 208, 120], [0, 144, 0], [2, 64, 0], [9, 32, 0], [0, 128, 0], [8, 0, 0]], x0: -6 }], fly_left: [{ off: 8, w: 2, h: 24, rows: [[1, 224], [0, 112], [7, 180], [7, 116], [7, 116], [3, 230], [0, 6], [1, 234], [11, 46], [11, 42], [124, 46], [3, 218], [1, 222], [31, 188], [31, 148], [24, 42], [0, 62], [56, 0], [120, 10], [0, 28], [0, 34], [0, 27], [0, 4], [0, 8]], x0: 2 }, { off: 8, w: 2, h: 24, rows: [[7, 128], [1, 192], [30, 208], [29, 208], [29, 208], [15, 152], [0, 24], [7, 168], [44, 184], [44, 168], [240, 184], [15, 104], [7, 120], [126, 240], [126, 80], [96, 168], [0, 248], [224, 0], [224, 168], [1, 16], [0, 80], [0, 160], [0, 10], [0, 80]], x0: 4 }, { off: 0, w: 3, h: 24, rows: [[0, 30, 0], [0, 7, 0], [0, 123, 64], [0, 119, 64], [0, 119, 64], [0, 62, 96], [0, 0, 96], [0, 30, 160], [0, 178, 224], [0, 178, 160], [7, 194, 224], [0, 61, 160], [0, 29, 224], [1, 251, 192], [1, 249, 64], [1, 130, 160], [0, 3, 224], [3, 128, 0], [7, 131, 96], [0, 1, 0], [0, 0, 96], [0, 1, 8], [0, 0, 32], [0, 0, 128]], x0: -2 }, { off: 0, w: 3, h: 24, rows: [[0, 120, 0], [0, 28, 0], [1, 237, 0], [1, 221, 0], [1, 221, 0], [0, 249, 128], [0, 1, 128], [0, 122, 128], [2, 203, 128], [2, 202, 128], [31, 11, 128], [0, 246, 128], [0, 119, 128], [7, 239, 0], [7, 229, 0], [6, 10, 128], [0, 15, 128], [14, 0, 0], [30, 11, 64], [0, 9, 0], [0, 2, 64], [0, 4, 144], [0, 1, 0], [0, 0, 16]], x0: 0 }], walk_right: [{ off: 0, w: 2, h: 24, rows: [[7, 128], [14, 0], [45, 224], [46, 224], [46, 224], [103, 192], [96, 0], [87, 128], [116, 208], [84, 208], [116, 62], [91, 192], [123, 192], [63, 192], [43, 192], [85, 192], [125, 192], [1, 128], [0, 0], [1, 128], [1, 192], [1, 224], [0, 0], [0, 0]], x0: 0 }, { off: 0, w: 2, h: 24, rows: [[1, 224], [3, 128], [19, 120], [19, 184], [11, 184], [25, 240], [24, 0], [21, 224], [29, 52], [21, 52], [29, 15], [22, 240], [30, 240], [15, 240], [10, 240], [21, 112], [31, 112], [0, 232], [0, 208], [1, 152], [1, 220], [1, 254], [0, 0], [0, 0]], x0: -2 }, { off: 0, w: 3, h: 24, rows: [[0, 120, 0], [0, 224, 0], [2, 222, 0], [2, 238, 0], [2, 238, 0], [6, 124, 0], [6, 0, 0], [5, 120, 0], [7, 77, 0], [5, 77, 0], [7, 67, 224], [5, 188, 0], [7, 188, 0], [3, 252, 0], [2, 188, 0], [5, 126, 0], [7, 222, 0], [0, 59, 0], [0, 115, 0], [1, 161, 128], [1, 193, 192], [0, 225, 224], [0, 0, 0], [0, 0, 0]], x0: -4 }, { off: 0, w: 3, h: 24, rows: [[0, 30, 0], [0, 56, 0], [1, 55, 128], [1, 59, 128], [1, 59, 128], [1, 143, 0], [1, 128, 0], [1, 94, 0], [1, 211, 64], [1, 83, 64], [1, 208, 248], [1, 111, 0], [1, 239, 0], [0, 255, 0], [0, 175, 0], [1, 87, 0], [1, 247, 0], [0, 14, 128], [0, 13, 0], [0, 25, 128], [0, 29, 192], [0, 31, 224], [0, 0, 0], [0, 0, 0]], x0: -6 }], walk_left: [{ off: 8, w: 2, h: 24, rows: [[1, 224], [0, 112], [7, 180], [7, 116], [7, 116], [3, 230], [0, 6], [1, 234], [11, 46], [11, 42], [124, 46], [3, 218], [3, 190], [3, 252], [3, 212], [3, 170], [3, 190], [1, 128], [0, 0], [1, 128], [3, 128], [7, 128], [0, 0], [0, 0]], x0: 2 }, { off: 8, w: 2, h: 24, rows: [[7, 128], [1, 192], [30, 200], [29, 200], [29, 208], [15, 152], [0, 24], [7, 168], [44, 184], [44, 168], [240, 184], [15, 104], [15, 232], [15, 240], [15, 80], [14, 168], [14, 248], [23, 0], [11, 0], [25, 128], [59, 128], [127, 128], [0, 0], [0, 0]], x0: 4 }, { off: 0, w: 3, h: 24, rows: [[0, 30, 0], [0, 7, 0], [0, 123, 64], [0, 119, 64], [0, 119, 64], [0, 62, 96], [0, 0, 96], [0, 30, 160], [0, 178, 224], [0, 178, 160], [7, 194, 224], [0, 61, 160], [0, 61, 224], [0, 63, 192], [0, 61, 64], [0, 126, 160], [0, 123, 224], [0, 220, 0], [0, 206, 0], [1, 133, 128], [3, 131, 128], [7, 135, 0], [0, 0, 0], [0, 0, 0]], x0: -2 }, { off: 0, w: 3, h: 24, rows: [[0, 120, 0], [0, 28, 0], [1, 236, 128], [1, 220, 128], [1, 220, 128], [0, 241, 128], [0, 1, 128], [0, 122, 128], [2, 203, 128], [2, 202, 128], [31, 11, 128], [0, 246, 128], [0, 247, 128], [0, 255, 0], [0, 245, 0], [0, 234, 128], [0, 239, 128], [1, 112, 0], [0, 176, 0], [1, 152, 0], [3, 184, 0], [7, 248, 0], [0, 0, 0], [0, 0, 0]], x0: 0 }] }, alien: { meteor: [{ w: 2, h: 11, rows: [[8, 16], [1, 120], [37, 244], [91, 194], [39, 157], [239, 227], [147, 249], [39, 227], [81, 142], [2, 236], [2, 248]] }, { w: 2, h: 11, rows: [[0, 144], [4, 112], [1, 228], [77, 154], [22, 63], [91, 143], [195, 227], [23, 223], [37, 166], [2, 140], [4, 120]] }], squidgy: [{ w: 2, h: 14, rows: [[10, 68], [22, 232], [15, 244], [79, 253], [63, 254], [121, 159], [246, 110], [54, 108], [249, 159], [63, 254], [95, 255], [107, 234], [26, 148], [18, 64]] }, { w: 2, h: 14, rows: [[18, 64], [26, 148], [107, 234], [95, 255], [63, 254], [249, 159], [54, 108], [246, 110], [121, 159], [63, 254], [77, 253], [15, 244], [22, 232], [10, 68]] }], sphere: [{ w: 2, h: 16, rows: [[7, 224], [31, 248], [63, 252], [121, 254], [113, 254], [227, 255], [231, 255], [231, 255], [255, 255], [255, 255], [255, 255], [127, 254], [127, 254], [63, 252], [31, 248], [7, 224]] }, { w: 2, h: 14, rows: [[7, 224], [31, 248], [57, 252], [113, 254], [99, 254], [231, 255], [231, 255], [255, 255], [255, 255], [127, 254], [127, 254], [63, 252], [31, 248], [7, 224]] }], jetFighter: [{ w: 2, h: 7, rows: [[120, 0], [30, 0], [207, 240], [255, 236], [251, 223], [199, 128], [31, 240]] }], ufo: [{ w: 2, h: 8, rows: [[1, 128], [7, 224], [13, 176], [63, 252], [127, 254], [217, 155], [127, 254], [63, 252]] }], crossShip: [{ w: 2, h: 15, rows: [[3, 128], [4, 192], [5, 192], [7, 192], [4, 64], [123, 188], [148, 82], [181, 86], [244, 94], [123, 188], [4, 64], [7, 192], [4, 64], [5, 192], [3, 128]] }], spaceCraft: [{ w: 2, h: 14, rows: [[16, 0], [30, 0], [63, 192], [97, 248], [192, 63], [255, 255], [202, 192], [202, 192], [255, 255], [192, 63], [97, 248], [63, 192], [30, 0], [16, 0]] }], frog: [{ w: 2, h: 14, rows: [[6, 96], [15, 240], [25, 152], [25, 152], [47, 244], [70, 110], [72, 158], [223, 255], [223, 255], [255, 255], [127, 254], [63, 252], [19, 200], [12, 48]] }] }, item: { goldBar: { off: 0, w: 2, h: 8, rows: [[15, 248], [31, 236], [63, 222], [32, 63], [64, 31], [64, 30], [128, 14], [255, 252]] }, fuelPod: { off: 0, w: 2, h: 11, rows: [[24, 24], [255, 255], [255, 255], [138, 139], [186, 187], [138, 155], [186, 187], [184, 137], [255, 255], [255, 255], [24, 24]] }, radiation: { off: 0, w: 2, h: 11, rows: [[15, 248], [16, 4], [36, 18], [78, 57], [111, 123], [32, 130], [96, 131], [65, 193], [35, 226], [16, 4], [15, 248]] }, chemical: { off: 0, w: 2, h: 13, rows: [[3, 128], [4, 192], [5, 192], [15, 224], [11, 160], [16, 16], [16, 16], [32, 8], [112, 28], [152, 38], [191, 238], [248, 62], [112, 28]] }, plutonium: { off: 0, w: 2, h: 9, rows: [[15, 240], [56, 60], [96, 126], [195, 255], [199, 255], [207, 255], [255, 255], [127, 254], [63, 252]] }, diamond: { off: 0, w: 2, h: 12, rows: [[3, 192], [15, 240], [31, 248], [47, 244], [71, 226], [104, 22], [56, 28], [31, 248], [15, 240], [7, 224], [3, 192], [1, 128]] } }, rocket: { models: [{ bottom: { off: 0, w: 2, h: 16, rows: [[185, 247], [185, 247], [185, 247], [185, 247], [249, 255], [169, 245], [169, 245], [175, 245], [244, 47], [245, 239], [85, 234], [82, 202], [137, 145], [185, 151], [184, 23], [184, 23]] }, middle: { off: 0, w: 2, h: 16, rows: [[9, 16], [9, 240], [9, 176], [9, 48], [9, 176], [25, 24], [25, 248], [41, 252], [41, 244], [89, 246], [89, 246], [137, 241], [185, 247], [185, 247], [185, 247], [185, 247]] }, top: { off: 0, w: 2, h: 16, rows: [[1, 128], [1, 128], [2, 192], [2, 192], [5, 224], [5, 224], [9, 240], [8, 16], [9, 240], [9, 240], [9, 240], [9, 240], [9, 240], [9, 80], [9, 80], [9, 80]] } }, { bottom: { off: 0, w: 2, h: 16, rows: [[13, 118], [11, 118], [27, 118], [55, 118], [55, 126], [87, 254], [87, 156], [215, 162], [215, 46], [215, 33], [215, 79], [215, 79], [223, 79], [192, 79], [128, 79], [128, 79]] }, middle: { off: 0, w: 2, h: 16, rows: [[11, 90], [11, 90], [13, 82], [11, 86], [11, 22], [11, 246], [11, 246], [13, 22], [11, 214], [11, 22], [11, 118], [11, 22], [15, 246], [15, 246], [12, 124], [11, 118]] }, top: { off: 0, w: 2, h: 16, rows: [[0, 56], [0, 124], [0, 242], [0, 242], [1, 242], [1, 242], [3, 242], [4, 242], [4, 242], [7, 242], [12, 250], [12, 250], [15, 250], [15, 250], [11, 250], [11, 250]] } }, { bottom: { off: 0, w: 2, h: 16, rows: [[217, 152], [166, 101], [166, 101], [127, 254], [69, 254], [69, 254], [69, 254], [69, 254], [127, 254], [40, 20], [92, 46], [92, 46], [130, 65], [158, 79], [158, 79], [158, 79]] }, middle: { off: 0, w: 2, h: 16, rows: [[127, 254], [217, 155], [217, 155], [166, 101], [166, 101], [255, 255], [139, 255], [139, 255], [138, 209], [138, 221], [138, 209], [138, 221], [138, 17], [139, 255], [255, 255], [217, 155]] }, top: { off: 0, w: 2, h: 16, rows: [[1, 128], [1, 128], [1, 128], [1, 128], [1, 128], [2, 64], [5, 224], [8, 16], [9, 240], [9, 240], [9, 240], [30, 8], [19, 248], [37, 252], [37, 252], [75, 254]] } }, { bottom: { off: 0, w: 2, h: 16, rows: [[187, 221], [251, 223], [171, 215], [171, 223], [171, 213], [139, 209], [251, 221], [243, 207], [242, 79], [229, 231], [229, 231], [200, 19], [201, 243], [137, 241], [137, 241], [128, 1]] }, middle: { off: 0, w: 2, h: 16, rows: [[25, 136], [17, 136], [25, 152], [29, 184], [31, 248], [31, 248], [31, 248], [15, 240], [143, 241], [143, 241], [143, 241], [151, 233], [151, 233], [151, 233], [187, 221], [187, 221]] }, top: { off: 0, w: 2, h: 16, rows: [[1, 128], [1, 128], [3, 192], [3, 192], [3, 192], [7, 224], [5, 160], [5, 160], [13, 176], [9, 144], [9, 144], [27, 152], [21, 136], [25, 136], [19, 136], [21, 136]] } }], flames: [{ off: 0, w: 2, h: 16, rows: [[0, 0], [47, 252], [127, 244], [94, 236], [183, 253], [46, 244], [87, 237], [138, 90], [55, 106], [83, 180], [36, 98], [11, 88], [16, 144], [2, 64], [4, 136], [0, 64]] }, { off: 0, w: 2, h: 16, rows: [[31, 252], [191, 122], [18, 244], [45, 46], [91, 212], [42, 169], [21, 210], [78, 24], [18, 200], [9, 164], [0, 0], [18, 64], [0, 32], [0, 0], [2, 0], [0, 128]] }] }, fx: { explosion: [{ off: 0, w: 3, h: 16, rows: [[0, 0, 0], [0, 0, 0], [0, 14, 0], [0, 51, 0], [0, 47, 176], [1, 255, 248], [3, 223, 248], [3, 172, 112], [3, 239, 192], [3, 223, 192], [1, 222, 192], [0, 12, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]] }, { off: 0, w: 3, h: 16, rows: [[0, 0, 0], [0, 0, 0], [7, 31, 128], [9, 191, 192], [30, 255, 216], [23, 223, 188], [31, 239, 236], [15, 239, 252], [31, 215, 248], [31, 191, 192], [31, 127, 224], [14, 254, 192], [0, 230, 0], [0, 124, 0], [0, 0, 0], [0, 0, 0]] }, { off: 0, w: 3, h: 16, rows: [[15, 14, 192], [59, 156, 224], [103, 211, 248], [111, 239, 196], [63, 239, 190], [221, 254, 255], [123, 255, 223], [126, 249, 191], [255, 126, 94], [255, 190, 228], [255, 127, 120], [252, 255, 252], [107, 254, 248], [15, 254, 240], [7, 248, 134], [1, 240, 0]] }] }, tiles: { platformLeft: [47, 127, 255, 221, 251, 123, 113, 33], platformMiddle: [189, 255, 255, 247, 235, 221, 173, 4], platformRight: [76, 254, 255, 62, 255, 254, 156, 8], lifeIcon: [24, 36, 60, 126, 90, 60, 60, 102] }, font: [[0, 0, 0, 0, 0, 0, 0, 0], [0, 16, 16, 16, 16, 0, 16, 0], [0, 36, 36, 0, 0, 0, 0, 0], [0, 36, 126, 36, 36, 126, 36, 0], [0, 8, 62, 40, 62, 10, 62, 8], [0, 98, 100, 8, 16, 38, 70, 0], [0, 16, 40, 16, 42, 68, 58, 0], [0, 8, 16, 0, 0, 0, 0, 0], [0, 4, 8, 8, 8, 8, 4, 0], [0, 32, 16, 16, 16, 16, 32, 0], [0, 0, 20, 8, 62, 8, 20, 0], [0, 0, 8, 8, 62, 8, 8, 0], [0, 0, 0, 0, 0, 8, 8, 16], [0, 0, 0, 0, 62, 0, 0, 0], [0, 0, 0, 0, 0, 24, 24, 0], [0, 0, 2, 4, 8, 16, 32, 0], [0, 60, 70, 74, 82, 98, 60, 0], [0, 24, 40, 8, 8, 8, 62, 0], [0, 60, 66, 2, 60, 64, 126, 0], [0, 60, 66, 12, 2, 66, 60, 0], [0, 8, 24, 40, 72, 126, 8, 0], [0, 126, 64, 124, 2, 66, 60, 0], [0, 60, 64, 124, 66, 66, 60, 0], [0, 126, 2, 4, 8, 16, 16, 0], [0, 60, 66, 60, 66, 66, 60, 0], [0, 60, 66, 66, 62, 2, 60, 0], [0, 0, 0, 16, 0, 0, 16, 0], [0, 0, 16, 0, 0, 16, 16, 32], [0, 0, 4, 8, 16, 8, 4, 0], [0, 0, 0, 62, 0, 62, 0, 0], [0, 0, 16, 8, 4, 8, 16, 0], [0, 60, 66, 4, 8, 0, 8, 0], [0, 60, 74, 86, 94, 64, 60, 0], [0, 60, 66, 66, 126, 66, 66, 0], [0, 124, 66, 124, 66, 66, 124, 0], [0, 60, 66, 64, 64, 66, 60, 0], [0, 120, 68, 66, 66, 68, 120, 0], [0, 126, 64, 124, 64, 64, 126, 0], [0, 126, 64, 124, 64, 64, 64, 0], [0, 60, 66, 64, 78, 66, 60, 0], [0, 66, 66, 126, 66, 66, 66, 0], [0, 62, 8, 8, 8, 8, 62, 0], [0, 2, 2, 2, 66, 66, 60, 0], [0, 68, 72, 112, 72, 68, 66, 0], [0, 64, 64, 64, 64, 64, 126, 0], [0, 66, 102, 90, 66, 66, 66, 0], [0, 66, 98, 82, 74, 70, 66, 0], [0, 60, 66, 66, 66, 66, 60, 0], [0, 124, 66, 66, 124, 64, 64, 0], [0, 60, 66, 66, 82, 74, 60, 0], [0, 124, 66, 66, 124, 68, 66, 0], [0, 60, 64, 60, 2, 66, 60, 0], [0, 254, 16, 16, 16, 16, 16, 0], [0, 66, 66, 66, 66, 66, 60, 0], [0, 66, 66, 66, 66, 36, 24, 0], [0, 66, 66, 66, 66, 90, 36, 0], [0, 66, 36, 24, 24, 36, 66, 0], [0, 130, 68, 40, 16, 16, 16, 0], [0, 126, 4, 8, 16, 32, 126, 0], [60, 66, 153, 161, 161, 153, 66, 60]] };
+
+// src/render/inflate.ts
+import * as THREE from "three";
+var PAD = 2;
+function toGrid(sp) {
+  const w0 = sp.w * 8 + PAD * 2;
+  const h0 = sp.h + PAD * 2;
+  const d = new Uint8Array(w0 * h0);
+  for (let y = 0; y < sp.h; y++) {
+    for (let bx = 0; bx < sp.w; bx++) {
+      const b = sp.rows[y][bx];
+      for (let i = 0; i < 8; i++) {
+        if (b >> 7 - i & 1) d[(y + PAD) * w0 + bx * 8 + i + PAD] = 1;
+      }
+    }
+  }
+  return { w: w0, h: h0, d };
+}
+function findHoles(g) {
+  const outside = new Uint8Array(g.d.length);
+  const stack = [0];
+  outside[0] = 1;
+  while (stack.length) {
+    const i = stack.pop();
+    const x = i % g.w;
+    const y = i / g.w | 0;
+    const tryPush = (xx, yy) => {
+      if (xx < 0 || yy < 0 || xx >= g.w || yy >= g.h) return;
+      const k = yy * g.w + xx;
+      if (g.d[k] || outside[k]) return;
+      outside[k] = 1;
+      stack.push(k);
+    };
+    tryPush(x + 1, y);
+    tryPush(x - 1, y);
+    tryPush(x, y + 1);
+    tryPush(x, y - 1);
+  }
+  const hole = new Uint8Array(g.d.length);
+  for (let i = 0; i < hole.length; i++) hole[i] = !g.d[i] && !outside[i] ? 1 : 0;
+  return hole;
+}
+function scale2x(g) {
+  const w = g.w * 2;
+  const h = g.h * 2;
+  const d = new Uint8Array(w * h);
+  const at = (x, y) => x < 0 || y < 0 || x >= g.w || y >= g.h ? 0 : g.d[y * g.w + x];
+  for (let y = 0; y < g.h; y++) {
+    for (let x = 0; x < g.w; x++) {
+      const p = at(x, y);
+      const a = at(x, y - 1);
+      const b = at(x + 1, y);
+      const c = at(x - 1, y);
+      const dd = at(x, y + 1);
+      const p1 = c === a && c !== dd && a !== b ? a : p;
+      const p2 = a === b && a !== c && b !== dd ? b : p;
+      const p3 = dd === c && dd !== b && c !== a ? c : p;
+      const p4 = b === dd && b !== a && dd !== c ? dd : p;
+      d[y * 2 * w + x * 2] = p1;
+      d[y * 2 * w + x * 2 + 1] = p2;
+      d[(y * 2 + 1) * w + x * 2] = p3;
+      d[(y * 2 + 1) * w + x * 2 + 1] = p4;
+    }
+  }
+  return { w, h, d };
+}
+function smooth(g) {
+  const out = new Uint8Array(g.d.length);
+  for (let y = 0; y < g.h; y++) {
+    for (let x = 0; x < g.w; x++) {
+      let s = 0;
+      let n = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          const yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= g.w || yy >= g.h) {
+            n++;
+            continue;
+          }
+          s += g.d[yy * g.w + xx];
+          n++;
+        }
+      }
+      out[y * g.w + x] = s / n > 0.5 ? 1 : 0;
+    }
+  }
+  return { w: g.w, h: g.h, d: out };
+}
+function distance(g, r) {
+  const out = new Float32Array(g.w * g.h);
+  const ri = Math.ceil(r);
+  for (let y = 0; y < g.h; y++) {
+    for (let x = 0; x < g.w; x++) {
+      if (!g.d[y * g.w + x]) continue;
+      let best = r;
+      for (let dy = -ri; dy <= ri; dy++) {
+        for (let dx = -ri; dx <= ri; dx++) {
+          const xx = x + dx;
+          const yy = y + dy;
+          const inside = xx >= 0 && yy >= 0 && xx < g.w && yy < g.h && g.d[yy * g.w + xx] === 1;
+          if (inside) continue;
+          const dist = Math.hypot(dx, dy);
+          if (dist < best) best = dist;
+        }
+      }
+      out[y * g.w + x] = best;
+    }
+  }
+  return out;
+}
+function inflateSprite(sp, opts = {}) {
+  const S = opts.scale ?? 4;
+  const depth = opts.depth ?? 2.5;
+  const round = opts.round ?? 1.4;
+  const edge = opts.edge ?? 0.35;
+  let g = toGrid(sp);
+  const holes0 = findHoles(g);
+  for (let i = 0; i < holes0.length; i++) if (holes0[i]) g.d[i] = 1;
+  const holeW0 = g.w;
+  let up = 1;
+  while (up < S) {
+    g = scale2x(g);
+    up *= 2;
+  }
+  g = smooth(g);
+  const hole = new Uint8Array(g.w * g.h);
+  for (let y = 0; y < g.h; y++) {
+    for (let x = 0; x < g.w; x++) {
+      if (holes0[(y / S | 0) * holeW0 + (x / S | 0)]) hole[y * g.w + x] = 1;
+    }
+  }
+  const roundCells = round * S;
+  const dist = distance(g, roundCells);
+  const W = g.w;
+  const H = g.h;
+  const half = new Float32Array(W * H);
+  for (let i = 0; i < half.length; i++) {
+    if (!g.d[i]) continue;
+    const t = Math.min(1, Math.max(0, (dist[i] - 0.5) / roundCells));
+    const profile = Math.sqrt(1 - (1 - t) * (1 - t));
+    half[i] = edge + (depth - edge) * profile;
+    if (hole[i]) half[i] = Math.min(half[i], depth * 0.35);
+  }
+  const inside = (x, y) => x >= 0 && y >= 0 && x < W && y < H && g.d[y * W + x] === 1;
+  const CW = W + 1;
+  const corner = new Float32Array(CW * (H + 1));
+  const used = new Uint8Array(CW * (H + 1));
+  for (let cy = 0; cy <= H; cy++) {
+    for (let cx = 0; cx <= W; cx++) {
+      let s = 0;
+      let n = 0;
+      for (const [ox, oy] of [[-1, -1], [0, -1], [-1, 0], [0, 0]]) {
+        const x = cx + ox;
+        const y = cy + oy;
+        if (inside(x, y)) {
+          s += half[y * W + x];
+          n++;
+        }
+      }
+      if (n) {
+        corner[cy * CW + cx] = s / n;
+        used[cy * CW + cx] = 1;
+      }
+    }
+  }
+  const rowsTotal = sp.h;
+  const x0 = sp.x0 ?? 0;
+  const boxW = sp.w * 8;
+  const px = (cx) => {
+    const v = cx / S - PAD + x0;
+    return opts.mirror ? boxW - v + 2 * x0 : v;
+  };
+  const py = (cy) => {
+    const row = cy / S - PAD;
+    const v = rowsTotal - row;
+    return opts.flipY ? rowsTotal - v : v;
+  };
+  const pos = [];
+  const idx = [];
+  const frontIndex = new Int32Array(CW * (H + 1)).fill(-1);
+  const backIndex = new Int32Array(CW * (H + 1)).fill(-1);
+  const getFront = (cx, cy, sign) => {
+    const map = sign === 1 ? frontIndex : backIndex;
+    const k = cy * CW + cx;
+    if (map[k] < 0) {
+      map[k] = pos.length / 3;
+      pos.push(px(cx), py(cy), sign * corner[k]);
+    }
+    return map[k];
+  };
+  const tri = (a, b, c, hx, hy, hz) => {
+    const ax = pos[a * 3], ay = pos[a * 3 + 1], az = pos[a * 3 + 2];
+    const ux = pos[b * 3] - ax, uy = pos[b * 3 + 1] - ay, uz = pos[b * 3 + 2] - az;
+    const vx = pos[c * 3] - ax, vy = pos[c * 3 + 1] - ay, vz = pos[c * 3 + 2] - az;
+    const nx = uy * vz - uz * vy;
+    const ny = uz * vx - ux * vz;
+    const nz = ux * vy - uy * vx;
+    if (nx * hx + ny * hy + nz * hz >= 0) idx.push(a, b, c);
+    else idx.push(a, c, b);
+  };
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      if (!inside(x, y)) continue;
+      const tlF = getFront(x, y, 1);
+      const trF = getFront(x + 1, y, 1);
+      const blF = getFront(x, y + 1, 1);
+      const brF = getFront(x + 1, y + 1, 1);
+      tri(tlF, blF, trF, 0, 0, 1);
+      tri(trF, blF, brF, 0, 0, 1);
+      const tlB = getFront(x, y, -1);
+      const trB = getFront(x + 1, y, -1);
+      const blB = getFront(x, y + 1, -1);
+      const brB = getFront(x + 1, y + 1, -1);
+      tri(tlB, trB, blB, 0, 0, -1);
+      tri(trB, brB, blB, 0, 0, -1);
+      const wall = (ax, ay, bx, by, ox, oy) => {
+        const base = pos.length / 3;
+        const ka = ay * CW + ax;
+        const kb = by * CW + bx;
+        pos.push(px(ax), py(ay), corner[ka]);
+        pos.push(px(bx), py(by), corner[kb]);
+        pos.push(px(bx), py(by), -corner[kb]);
+        pos.push(px(ax), py(ay), -corner[ka]);
+        const hx = opts.mirror ? -ox : ox;
+        const hy = opts.flipY ? oy : -oy;
+        tri(base, base + 1, base + 2, hx, hy, 0);
+        tri(base, base + 2, base + 3, hx, hy, 0);
+      };
+      if (!inside(x, y - 1)) wall(x + 1, y, x, y, 0, -1);
+      if (!inside(x, y + 1)) wall(x, y + 1, x + 1, y + 1, 0, 1);
+      if (!inside(x - 1, y)) wall(x, y, x, y + 1, -1, 0);
+      if (!inside(x + 1, y)) wall(x + 1, y + 1, x + 1, y, 1, 0);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+  geo.computeBoundingBox();
+  geo.computeBoundingSphere();
+  return geo;
+}
+
+// src/render/SpriteLibrary.ts
+var sprites = sprites_default;
+var COLLECTIBLE_SPRITES = {
+  32: "goldBar",
+  34: "radiation",
+  36: "chemical",
+  38: "plutonium",
+  40: "diamond"
+};
+var SpriteLibrary = class {
+  cache = /* @__PURE__ */ new Map();
+  get(key, make) {
+    let g = this.cache.get(key);
+    if (!g) {
+      g = make();
+      this.cache.set(key, g);
+    }
+    return g;
+  }
+  /** `slot` is the 0..3 frame index chosen from X position (original: (x & 6) >> 1). */
+  jetman(set, frame2) {
+    return this.get(
+      `j:${set}:${frame2}`,
+      () => inflateSprite(sprites.jetman[set][frame2], { scale: 4, depth: 2.6, round: 1.5 })
+    );
+  }
+  alien(kind, frame2, mirror) {
+    const frames = sprites.alien[kind];
+    const f = frames[frame2 % frames.length];
+    return this.get(
+      `a:${kind}:${frame2 % frames.length}:${mirror}`,
+      () => inflateSprite(f, { scale: 4, depth: 3, round: 1.6, mirror })
+    );
+  }
+  item(name) {
+    return this.get(
+      `i:${name}`,
+      () => inflateSprite(sprites.item[name], { scale: 4, depth: 2.4, round: 1.4 })
+    );
+  }
+  rocket(model, part) {
+    return this.get(
+      `r:${model}:${part}`,
+      () => inflateSprite(sprites.rocket.models[model][part], { scale: 4, depth: 3.6, round: 2, edge: 0.5 })
+    );
+  }
+  flame(frame2) {
+    return this.get(
+      `f:${frame2}`,
+      () => inflateSprite(sprites.rocket.flames[frame2 % 2], { scale: 2, depth: 2, round: 1.5 })
+    );
+  }
+  /** Pixel height of a sprite (for placement). */
+  static itemHeight(name) {
+    return sprites.item[name].h;
+  }
+};
+
+// src/render/Particles.ts
+import * as THREE2 from "three";
+var Particles = class {
+  mesh;
+  max;
+  pos;
+  vel;
+  life;
+  maxLife;
+  size;
+  colours;
+  next = 0;
+  dummy = new THREE2.Object3D();
+  constructor(scene, max) {
+    this.max = max;
+    this.pos = new Float32Array(max * 3);
+    this.vel = new Float32Array(max * 3);
+    this.life = new Float32Array(max);
+    this.maxLife = new Float32Array(max).fill(1);
+    this.size = new Float32Array(max).fill(1);
+    this.colours = Array.from({ length: max }, () => new THREE2.Color(16777215));
+    this.mesh = new THREE2.InstancedMesh(
+      new THREE2.IcosahedronGeometry(0.6, 1),
+      new THREE2.MeshBasicMaterial({ toneMapped: false }),
+      max
+    );
+    this.mesh.instanceMatrix.setUsage(THREE2.DynamicDrawUsage);
+    this.mesh.frustumCulled = false;
+    this.mesh.instanceColor = new THREE2.InstancedBufferAttribute(new Float32Array(max * 3), 3);
+    scene.add(this.mesh);
+    for (let i = 0; i < max; i++) this.hideInstance(i);
+  }
+  hideInstance(i) {
+    this.dummy.position.set(0, -9999, 0);
+    this.dummy.scale.setScalar(1e-4);
+    this.dummy.updateMatrix();
+    this.mesh.setMatrixAt(i, this.dummy.matrix);
+  }
+  spawn(x, y, vx, vy, life, colour, size = 1, vz = 0) {
+    const i = this.next;
+    this.next = (this.next + 1) % this.max;
+    this.pos[i * 3] = x;
+    this.pos[i * 3 + 1] = y;
+    this.pos[i * 3 + 2] = (Math.random() - 0.5) * 3;
+    this.vel[i * 3] = vx;
+    this.vel[i * 3 + 1] = vy;
+    this.vel[i * 3 + 2] = vz;
+    this.life[i] = life;
+    this.maxLife[i] = life;
+    this.size[i] = size;
+    this.colours[i].setHex(colour);
+  }
+  burst(x, y, count, speed, palette) {
+    for (let n = 0; n < count; n++) {
+      const a = Math.random() * Math.PI * 2;
+      const e = Math.acos(2 * Math.random() - 1);
+      const s = speed * (0.25 + Math.random() * 0.75);
+      this.spawn(
+        x,
+        y,
+        Math.cos(a) * Math.sin(e) * s,
+        Math.sin(a) * Math.sin(e) * s,
+        0.45 + Math.random() * 0.7,
+        palette[Math.random() * palette.length | 0],
+        0.8 + Math.random() * 1.8,
+        Math.cos(e) * s
+      );
+    }
+  }
+  update(dt) {
+    let alive = false;
+    for (let i = 0; i < this.max; i++) {
+      if (this.life[i] <= 0) continue;
+      this.life[i] -= dt;
+      alive = true;
+      if (this.life[i] <= 0) {
+        this.hideInstance(i);
+        continue;
+      }
+      const p = i * 3;
+      this.vel[p + 1] -= 30 * dt;
+      this.pos[p] += this.vel[p] * dt;
+      this.pos[p + 1] += this.vel[p + 1] * dt;
+      this.pos[p + 2] += this.vel[p + 2] * dt;
+      const t = this.life[i] / this.maxLife[i];
+      this.dummy.position.set(this.pos[p], this.pos[p + 1], this.pos[p + 2]);
+      this.dummy.scale.setScalar(this.size[i] * (0.25 + t));
+      this.dummy.updateMatrix();
+      this.mesh.setMatrixAt(i, this.dummy.matrix);
+      this.mesh.setColorAt(i, this.colours[i]);
+    }
+    if (!alive) return;
+    this.mesh.instanceMatrix.needsUpdate = true;
+    if (this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
+  }
+};
+
+// src/render/Backdrop.ts
+import * as THREE3 from "three";
+var SUN_DIR = new THREE3.Vector3(-0.42, 0.55, 0.72).normalize();
+var PLANETS = [
+  { name: "earth", map: "earth_atmos_2048.jpg", radius: 108, atmosphere: 6134783, atmosphereStrength: 1, tilt: 0.41, earth: true, fallback: 2777e3 },
+  { name: "mars", map: "2k_mars.jpg", radius: 88, atmosphere: 14714970, atmosphereStrength: 0.45, tilt: 0.44, fallback: 11030574 },
+  { name: "jupiter", map: "2k_jupiter.jpg", radius: 140, atmosphere: 15255968, atmosphereStrength: 0.35, tilt: 0.05, fallback: 13148272 },
+  { name: "venus", map: "2k_venus_atmosphere.jpg", radius: 100, atmosphere: 16766090, atmosphereStrength: 0.9, tilt: 0.05, fallback: 14200944 },
+  { name: "saturn", map: "2k_saturn.jpg", radius: 105, atmosphere: 15785128, atmosphereStrength: 0.35, tilt: 0.47, rings: true, fallback: 14205072 },
+  { name: "mercury", map: "2k_mercury.jpg", radius: 66, tilt: 0, fallback: 9078144 },
+  { name: "neptune", map: "2k_neptune.jpg", radius: 96, atmosphere: 4878591, atmosphereStrength: 0.9, tilt: 0.5, fallback: 2773192 },
+  { name: "uranus", map: "2k_uranus.jpg", radius: 92, atmosphere: 10480370, atmosphereStrength: 0.8, tilt: 1.2, fallback: 9099488 }
+];
+var BASE = "./";
+var Backdrop = class {
+  constructor(scene, renderer) {
+    this.scene = scene;
+    this.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+    const sky = this.texture("2k_stars_milky_way.jpg", true);
+    sky.mapping = THREE3.EquirectangularReflectionMapping;
+    scene.background = sky;
+    scene.backgroundIntensity = 0.85;
+    scene.backgroundRotation.set(0.3, 0.6, 0);
+    this.sunSprite = this.makeSun();
+    scene.add(this.sunSprite);
+    this.main.position.set(235, 235, -470);
+    scene.add(this.main);
+    const sideA = this.buildPlanet(PLANETS[2]);
+    sideA.position.set(-1e3, 120, 60);
+    sideA.scale.setScalar(1.6);
+    scene.add(sideA);
+    const sideB = this.buildPlanet(PLANETS[1]);
+    sideB.position.set(260, -140, 980);
+    sideB.scale.setScalar(1.2);
+    scene.add(sideB);
+    const far = this.buildPlanet(PLANETS[6]);
+    far.position.set(-1150, 380, -1100);
+    far.scale.setScalar(1.8);
+    scene.add(far);
+    this.buildStars();
+    for (let i = 0; i < 4; i++) {
+      const mesh = new THREE3.Mesh(
+        new THREE3.BoxGeometry(1, 1.4, 1.4),
+        new THREE3.MeshBasicMaterial({
+          color: 13625599,
+          transparent: true,
+          opacity: 0,
+          toneMapped: false,
+          blending: THREE3.AdditiveBlending,
+          depthWrite: false
+        })
+      );
+      mesh.visible = false;
+      scene.add(mesh);
+      this.streaks.push({ mesh, vx: 0, vy: 0, life: 0, max: 1 });
+    }
+  }
+  scene;
+  loader = new THREE3.TextureLoader();
+  textures = /* @__PURE__ */ new Map();
+  spinners = [];
+  starGroups = [];
+  streaks = [];
+  main = new THREE3.Group();
+  mainLevel = -1;
+  moonPivot = new THREE3.Object3D();
+  nightUniforms = [];
+  sunView = new THREE3.Vector3();
+  nextStreak = 1.5;
+  anisotropy;
+  sunSprite;
+  // ------------------------------------------------------------------ helpers
+  texture(file, srgb = true) {
+    let t = this.textures.get(file);
+    if (!t) {
+      t = this.loader.load(`${BASE}textures/${file}`);
+      if (srgb) t.colorSpace = THREE3.SRGBColorSpace;
+      t.anisotropy = this.anisotropy;
+      this.textures.set(file, t);
+    }
+    return t;
+  }
+  makeSun() {
+    const c = document.createElement("canvas");
+    c.width = c.height = 256;
+    const ctx = c.getContext("2d");
+    const g = ctx.createRadialGradient(128, 128, 0, 128, 128, 128);
+    g.addColorStop(0, "rgba(255,255,255,1)");
+    g.addColorStop(0.08, "rgba(255,250,225,1)");
+    g.addColorStop(0.2, "rgba(255,220,150,0.55)");
+    g.addColorStop(0.5, "rgba(255,170,90,0.14)");
+    g.addColorStop(1, "rgba(255,140,60,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, 256, 256);
+    const tex = new THREE3.CanvasTexture(c);
+    tex.colorSpace = THREE3.SRGBColorSpace;
+    const s = new THREE3.Sprite(
+      new THREE3.SpriteMaterial({ map: tex, blending: THREE3.AdditiveBlending, depthWrite: false, toneMapped: false })
+    );
+    s.position.copy(SUN_DIR).multiplyScalar(2600);
+    s.scale.setScalar(900);
+    return s;
+  }
+  buildPlanet(def) {
+    const group = new THREE3.Group();
+    const tilt = new THREE3.Group();
+    tilt.rotation.z = def.tilt;
+    group.add(tilt);
+    const mat = new THREE3.MeshStandardMaterial({
+      map: this.texture(def.map),
+      color: 16777215,
+      roughness: 0.9,
+      metalness: 0
+    });
+    mat.color.set(16777215);
+    const body = new THREE3.Mesh(new THREE3.SphereGeometry(def.radius, 96, 64), mat);
+    tilt.add(body);
+    this.spinners.push({ object: body, speed: 0.035 });
+    if (def.earth) {
+      mat.normalMap = this.texture("earth_normal_2048.jpg", false);
+      mat.normalScale.set(0.8, 0.8);
+      mat.roughness = 0.75;
+      mat.emissiveMap = this.texture("earth_lights_2048.png");
+      mat.emissive.set(16767392);
+      mat.emissiveIntensity = 1.4;
+      const sunView = { value: new THREE3.Vector3() };
+      this.nightUniforms.push(sunView);
+      mat.onBeforeCompile = (sh) => {
+        sh.uniforms.uSunView = sunView;
+        sh.fragmentShader = sh.fragmentShader.replace("#include <common>", "#include <common>\nuniform vec3 uSunView;").replace(
+          "#include <emissivemap_fragment>",
+          "#include <emissivemap_fragment>\ntotalEmissiveRadiance *= smoothstep(0.08, -0.18, dot(normalize(normal), normalize(uSunView)));"
+        );
+      };
+      const clouds = new THREE3.Mesh(
+        new THREE3.SphereGeometry(def.radius * 1.012, 96, 64),
+        new THREE3.MeshStandardMaterial({
+          map: this.texture("earth_clouds_1024.png"),
+          alphaMap: this.texture("earth_clouds_1024.png", false),
+          transparent: true,
+          depthWrite: false,
+          roughness: 1
+        })
+      );
+      tilt.add(clouds);
+      this.spinners.push({ object: clouds, speed: 0.05 });
+    }
+    if (def.rings) {
+      const inner = def.radius * 1.3;
+      const outer = def.radius * 2.35;
+      const geo = new THREE3.RingGeometry(inner, outer, 160, 1);
+      const pos = geo.attributes.position;
+      const uv = geo.attributes.uv;
+      const v = new THREE3.Vector3();
+      for (let i = 0; i < pos.count; i++) {
+        v.fromBufferAttribute(pos, i);
+        uv.setXY(i, (v.length() - inner) / (outer - inner), 0.5);
+      }
+      const ring = new THREE3.Mesh(
+        geo,
+        new THREE3.MeshStandardMaterial({
+          map: this.texture("2k_saturn_ring_alpha.png"),
+          side: THREE3.DoubleSide,
+          transparent: true,
+          depthWrite: false,
+          roughness: 1
+        })
+      );
+      ring.rotation.x = -Math.PI / 2;
+      tilt.add(ring);
+    }
+    if (def.atmosphere) {
+      const atm = new THREE3.Mesh(
+        new THREE3.SphereGeometry(def.radius * 1.07, 64, 48),
+        new THREE3.ShaderMaterial({
+          transparent: true,
+          depthWrite: false,
+          side: THREE3.BackSide,
+          blending: THREE3.AdditiveBlending,
+          uniforms: {
+            uColor: { value: new THREE3.Color(def.atmosphere) },
+            uStrength: { value: def.atmosphereStrength ?? 1 }
+          },
+          vertexShader: `varying vec3 vN; varying vec3 vV;
+            void main(){ vec4 mv = modelViewMatrix * vec4(position,1.0); vN = normalize(normalMatrix * normal); vV = normalize(-mv.xyz); gl_Position = projectionMatrix * mv; }`,
+          fragmentShader: `varying vec3 vN; varying vec3 vV; uniform vec3 uColor; uniform float uStrength;
+            void main(){ float f = pow(1.0 - abs(dot(normalize(vN), normalize(vV))), 2.6); gl_FragColor = vec4(uColor, f * 0.85 * uStrength); }`
+        })
+      );
+      group.add(atm);
+    }
+    return group;
+  }
+  buildStars() {
+    const defs = [
+      { n: 900, r: [900, 1500], size: 2, speed: 4e-3, axis: new THREE3.Vector3(0.1, 1, 0.05) },
+      { n: 600, r: [600, 900], size: 2.6, speed: 9e-3, axis: new THREE3.Vector3(-0.2, 1, 0.1) },
+      { n: 320, r: [350, 600], size: 3.4, speed: 0.018, axis: new THREE3.Vector3(0.3, 1, -0.2) }
+    ];
+    for (const d of defs) {
+      const pos = new Float32Array(d.n * 3);
+      const col = new Float32Array(d.n * 3);
+      const v = new THREE3.Vector3();
+      for (let i = 0; i < d.n; i++) {
+        v.set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize();
+        v.multiplyScalar(d.r[0] + Math.random() * (d.r[1] - d.r[0]));
+        pos.set([v.x + 128, v.y + 96, v.z], i * 3);
+        const c = new THREE3.Color().setHSL(0.55 + Math.random() * 0.2, 0.5, 0.7 + Math.random() * 0.3);
+        col.set([c.r, c.g, c.b], i * 3);
+      }
+      const geo = new THREE3.BufferGeometry();
+      geo.setAttribute("position", new THREE3.BufferAttribute(pos, 3));
+      geo.setAttribute("color", new THREE3.BufferAttribute(col, 3));
+      const points = new THREE3.Points(
+        geo,
+        new THREE3.PointsMaterial({ size: d.size, vertexColors: true, sizeAttenuation: false, toneMapped: false, transparent: true, opacity: 0.9 })
+      );
+      points.frustumCulled = false;
+      const group = new THREE3.Group();
+      group.position.set(128, 96, 0);
+      points.position.set(-128, -96, 0);
+      group.add(points);
+      group.userData = { speed: d.speed, axis: d.axis.clone().normalize() };
+      this.scene.add(group);
+      this.starGroups.push(group);
+    }
+  }
+  setLevel(level) {
+    this.mainLevel = level;
+    for (const c of [...this.main.children]) this.main.remove(c);
+    const def = PLANETS[level % PLANETS.length];
+    const planet = this.buildPlanet(def);
+    this.main.add(planet);
+    this.moonPivot = new THREE3.Object3D();
+    this.moonPivot.rotation.x = 0.35;
+    const moon = new THREE3.Mesh(
+      new THREE3.SphereGeometry(15, 40, 28),
+      new THREE3.MeshStandardMaterial({ map: this.texture("moon_1024.jpg"), roughness: 1 })
+    );
+    moon.position.set(def.radius * 1.9, 0, 0);
+    this.moonPivot.add(moon);
+    this.main.add(this.moonPivot);
+    this.spinners.push({ object: moon, speed: 0.02 });
+  }
+  // ------------------------------------------------------------------- update
+  update(dt, level, camera) {
+    if (level !== this.mainLevel) this.setLevel(level);
+    for (const s of this.spinners) s.object.rotation.y += s.speed * dt;
+    this.moonPivot.rotation.y += dt * 0.1;
+    this.scene.backgroundRotation.y += dt * 15e-4;
+    for (const g of this.starGroups) {
+      g.rotateOnAxis(g.userData.axis, g.userData.speed * dt);
+    }
+    this.sunView.copy(SUN_DIR).transformDirection(camera.matrixWorldInverse);
+    for (const u of this.nightUniforms) u.value.copy(this.sunView);
+    this.nextStreak -= dt;
+    if (this.nextStreak <= 0) {
+      this.nextStreak = 1.2 + Math.random() * 3;
+      const s = this.streaks.find((x) => x.life <= 0);
+      if (s) {
+        const fromRight = Math.random() < 0.5;
+        s.vx = (fromRight ? -1 : 1) * (260 + Math.random() * 200);
+        s.vy = -(60 + Math.random() * 120);
+        s.max = s.life = 0.7 + Math.random() * 0.5;
+        s.mesh.position.set(fromRight ? 330 + Math.random() * 60 : -70 - Math.random() * 60, 120 + Math.random() * 160, -90 - Math.random() * 120);
+        s.mesh.rotation.z = Math.atan2(s.vy, s.vx);
+        s.mesh.scale.set(30 + Math.random() * 30, 1, 1);
+        s.mesh.visible = true;
+      }
+    }
+    for (const s of this.streaks) {
+      if (s.life <= 0) continue;
+      s.life -= dt;
+      if (s.life <= 0) {
+        s.mesh.visible = false;
+        continue;
+      }
+      s.mesh.position.x += s.vx * dt;
+      s.mesh.position.y += s.vy * dt;
+      s.mesh.material.opacity = Math.min(1, s.life / s.max * 1.6);
+    }
+  }
+};
+
+// src/render/GameView.ts
+var BOTTOM = (y) => SCREEN_H - y;
+var matCache = /* @__PURE__ */ new Map();
+function material(hex) {
+  let m = matCache.get(hex);
+  if (!m) {
+    m = new THREE4.MeshStandardMaterial({
+      color: hex,
+      emissive: hex,
+      emissiveIntensity: 0.22,
+      metalness: 0.15,
+      roughness: 0.42
+    });
+    matCache.set(hex, m);
+  }
+  return m;
+}
+var attrColour = (attr) => SPECTRUM_BRIGHT[attr & 7];
+var ActorView = class {
+  main = new THREE4.Mesh();
+  ghost = new THREE4.Mesh();
+  constructor(parent) {
+    this.main.visible = false;
+    this.ghost.visible = false;
+    parent.add(this.main, this.ghost);
+  }
+  hide() {
+    this.main.visible = false;
+    this.ghost.visible = false;
+  }
+  set(geo, mat, x, yBottom, z = 0, width = 16) {
+    for (const m of [this.main, this.ghost]) {
+      m.geometry = geo;
+      m.material = mat;
+    }
+    this.main.visible = true;
+    this.main.position.set(x, yBottom, z);
+    if (x > SCREEN_W - width) {
+      this.ghost.visible = true;
+      this.ghost.position.set(x - SCREEN_W, yBottom, z);
+    } else if (x < 0) {
+      this.ghost.visible = true;
+      this.ghost.position.set(x + SCREEN_W, yBottom, z);
+    } else {
+      this.ghost.visible = false;
+    }
+  }
+};
+function lerpWrap(prev, cur, a) {
+  return Math.abs(cur - prev) > 128 ? cur : prev + (cur - prev) * a;
+}
+function rocketMaterial() {
+  const m = new THREE4.MeshStandardMaterial({
+    color: 16777215,
+    emissive: 16777215,
+    emissiveIntensity: 0.14,
+    metalness: 0.35,
+    roughness: 0.32
+  });
+  const fuelY = { value: -1e3 };
+  const fuel = { value: new THREE4.Color(16711935) };
+  m.onBeforeCompile = (sh) => {
+    sh.uniforms.uFuelY = fuelY;
+    sh.uniforms.uFuel = fuel;
+    sh.vertexShader = sh.vertexShader.replace("#include <common>", "#include <common>\nvarying float vWY;").replace("#include <begin_vertex>", "#include <begin_vertex>\nvWY = (modelMatrix * vec4(transformed, 1.0)).y;");
+    sh.fragmentShader = sh.fragmentShader.replace("#include <common>", "#include <common>\nvarying float vWY;\nuniform float uFuelY;\nuniform vec3 uFuel;").replace("#include <color_fragment>", "#include <color_fragment>\nif (vWY < uFuelY) diffuseColor.rgb = uFuel;").replace(
+      "#include <emissivemap_fragment>",
+      "#include <emissivemap_fragment>\nif (vWY < uFuelY) totalEmissiveRadiance = uFuel * 0.35;"
+    );
+  };
+  return { material: m, fuelY, fuel };
+}
+var GameView = class {
+  constructor(canvas2, game2) {
+    this.canvas = canvas2;
+    this.game = game2;
+    this.renderer = new THREE4.WebGLRenderer({ canvas: canvas2, antialias: true, powerPreference: "high-performance" });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2.5));
+    this.renderer.outputColorSpace = THREE4.SRGBColorSpace;
+    this.renderer.toneMapping = THREE4.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.05;
+    this.camera = new THREE4.PerspectiveCamera(16, 4 / 3, 1, 8e3);
+    this.scene.add(new THREE4.HemisphereLight(12374783, 1708080, 0.7));
+    const key = new THREE4.DirectionalLight(16774368, 2.8);
+    key.position.copy(SUN_DIR).multiplyScalar(500);
+    this.scene.add(key);
+    const rim = new THREE4.DirectionalLight(6719743, 0.9);
+    rim.position.set(260, 80, -120);
+    this.scene.add(rim);
+    this.backdrop = new Backdrop(this.scene, this.renderer);
+    this.scene.add(this.platformGroup);
+    this.buildPlatforms();
+    this.jetman = new ActorView(this.scene);
+    for (let i = 0; i < 3; i++) this.rocketParts.push(new ActorView(this.scene));
+    this.flames = new ActorView(this.scene);
+    this.pod = new ActorView(this.scene);
+    this.item = new ActorView(this.scene);
+    for (let i = 0; i < 6; i++) this.aliens.push(new ActorView(this.scene));
+    for (let i = 0; i < 12; i++) {
+      const beam = new THREE4.Mesh(
+        new THREE4.BoxGeometry(1, 1.6, 1.6),
+        new THREE4.MeshBasicMaterial({ color: 16777215, toneMapped: false })
+      );
+      beam.visible = false;
+      this.scene.add(beam);
+      this.laserMeshes.push(beam);
+    }
+    this.particles = new Particles(this.scene, 900);
+    this.resize();
+    window.addEventListener("resize", () => this.resize());
+  }
+  canvas;
+  game;
+  renderer;
+  scene = new THREE4.Scene();
+  camera;
+  lib = new SpriteLibrary();
+  particles;
+  seenBooms = /* @__PURE__ */ new WeakSet();
+  jetman;
+  rocketParts = [];
+  flames;
+  pod;
+  item;
+  aliens = [];
+  laserMeshes = [];
+  rocketMat = rocketMaterial();
+  platformGroup = new THREE4.Group();
+  backdrop;
+  camTarget = new THREE4.Vector3(128, 96, 0);
+  emitAcc = 0;
+  /** Debug: values below 1 move the camera closer. */
+  zoom = 1;
+  /** Debug: camera focus override in play-field pixels. */
+  focus = null;
+  // ------------------------------------------------------------------- set up
+  rockTexture(tiles, ink) {
+    const cell = Math.max(2, Math.min(24, Math.floor(4096 / (tiles * 8))));
+    const c = document.createElement("canvas");
+    c.width = tiles * 8 * cell;
+    c.height = 8 * cell;
+    const ctx = c.getContext("2d");
+    const base = new THREE4.Color(ink);
+    ctx.fillStyle = `#${base.clone().multiplyScalar(0.55).getHexString()}`;
+    ctx.fillRect(0, 0, c.width, c.height);
+    let seed = 12345;
+    const rnd2 = () => (seed = seed * 1664525 + 1013904223 >>> 0) / 4294967296;
+    for (let i = 0; i < tiles * 90; i++) {
+      const x = rnd2() * c.width;
+      const y = rnd2() * c.height;
+      const r = 3 + rnd2() * 9;
+      const l = 0.6 + rnd2() * 0.7;
+      ctx.fillStyle = `#${base.clone().multiplyScalar(l).getHexString()}`;
+      ctx.beginPath();
+      ctx.ellipse(x, y, r, r * (0.6 + rnd2() * 0.5), rnd2() * 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    const tex = new THREE4.CanvasTexture(c);
+    tex.colorSpace = THREE4.SRGBColorSpace;
+    tex.anisotropy = 8;
+    return tex;
+  }
+  buildPlatforms() {
+    for (const p of PLATFORMS) {
+      const r = platformRect(p);
+      const ground = p.y > 150;
+      const extra = ground ? 600 : 0;
+      const w = r.w + extra * 2;
+      const depth = ground ? 44 : 14;
+      const geo = new RoundedBoxGeometry(w, r.h, depth, 4, 2.2);
+      const colour = ground ? 13214778 : 3523146;
+      const tex = this.rockTexture(Math.max(4, Math.round(w / 8)), colour);
+      const mesh = new THREE4.Mesh(
+        geo,
+        new THREE4.MeshStandardMaterial({ map: tex, bumpMap: tex, bumpScale: 2.5, roughness: 0.8, metalness: 0.05 })
+      );
+      mesh.position.set(r.x + r.w / 2, BOTTOM(r.y + r.h) + r.h / 2, 0);
+      this.platformGroup.add(mesh);
+      if (!ground) {
+        for (const off of [-SCREEN_W, SCREEN_W]) {
+          const copy = mesh.clone();
+          copy.position.x += off;
+          this.platformGroup.add(copy);
+        }
+      }
+    }
+    const crust = new THREE4.Mesh(
+      new THREE4.BoxGeometry(2400, 400, 120),
+      new THREE4.MeshStandardMaterial({ color: 1182754, roughness: 1 })
+    );
+    crust.position.set(128, -200, -20);
+    this.scene.add(crust);
+  }
+  /** Build every mesh and compile every shader up front so nothing hitches mid-game. */
+  prewarm() {
+    const holder = new THREE4.Group();
+    this.scene.add(holder);
+    const add = (geo, mat) => {
+      const m = new THREE4.Mesh(geo, mat);
+      holder.add(m);
+    };
+    for (const set of ["fly_right", "fly_left", "walk_right", "walk_left"]) {
+      for (let f = 0; f < 4; f++) add(this.lib.jetman(set, f), material(16777215));
+    }
+    const kinds = ["meteor", "squidgy", "sphere", "jetFighter", "ufo", "crossShip", "spaceCraft", "frog"];
+    for (const k of kinds) for (let f = 0; f < 2; f++) for (const m of [false, true]) add(this.lib.alien(k, f, m), material(16711680));
+    for (let m = 0; m < 4; m++) for (const p of ["bottom", "middle", "top"]) add(this.lib.rocket(m, p), this.rocketMat.material);
+    for (const n of ["goldBar", "fuelPod", "radiation", "chemical", "plutonium", "diamond"]) add(this.lib.item(n), material(16776960));
+    add(this.lib.flame(0), material(16726544));
+    add(this.lib.flame(1), material(16726544));
+    for (const hex of SPECTRUM_BRIGHT) material(hex);
+    this.renderer.compile(this.scene, this.camera);
+    this.scene.remove(holder);
+  }
+  resize() {
+    const w = Math.max(1, this.canvas.clientWidth);
+    const h = Math.max(1, this.canvas.clientHeight);
+    this.renderer.setSize(w, h, false);
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+  }
+  fitDistance() {
+    const vfov = THREE4.MathUtils.degToRad(this.camera.fov);
+    const vert = SCREEN_H * 0.5 / Math.tan(vfov / 2);
+    const horiz = SCREEN_W * 0.5 / (Math.tan(vfov / 2) * this.camera.aspect);
+    return Math.max(vert, horiz) * this.zoom;
+  }
+  // ------------------------------------------------------------------- frame
+  render(alpha, dt) {
+    const g = this.game;
+    this.backdrop.update(dt, g.level, this.camera);
+    this.syncJetman(alpha);
+    this.syncRocket(alpha);
+    this.syncItems(alpha);
+    this.syncAliens(alpha);
+    this.syncLasers(alpha);
+    this.syncBooms();
+    this.emitThrust(dt);
+    this.particles.update(dt);
+    this.updateCamera(dt);
+    void g;
+    this.renderer.render(this.scene, this.camera);
+  }
+  syncJetman(alpha) {
+    const j = this.game.jetman;
+    const blinkOff = this.game.beginDelay > 0 && (this.game.tick >> 2 & 1) === 1;
+    const show = j.mode !== "none" && j.active && !blinkOff;
+    if (!show) {
+      this.jetman.hide();
+      return;
+    }
+    const x = lerpWrap(j.px, j.x, alpha);
+    const y = lerpWrap(j.py, j.y, alpha);
+    const walking = j.mode === "walk";
+    const set = `${walking ? "walk" : "fly"}_${j.faceLeft ? "left" : "right"}`;
+    const slot = (Math.floor(x) & 6) >> 1;
+    const frame2 = j.faceLeft ? 3 - slot : slot;
+    this.jetman.set(this.lib.jetman(set, frame2), material(16777215), x + (j.faceLeft ? -3 : 1), BOTTOM(y), 0, 24);
+  }
+  syncRocket(alpha) {
+    const r = this.game.rocket;
+    const y = lerpWrap(r.py, r.y, alpha);
+    const parts = ["bottom", "middle", "top"];
+    const bottom = BOTTOM(y);
+    for (let i = 0; i < 3; i++) {
+      if (i < r.modules) {
+        this.rocketParts[i].set(this.lib.rocket(r.model, parts[i]), this.rocketMat.material, r.x, bottom + 16 * i, 0);
+      } else this.rocketParts[i].hide();
+    }
+    const full = r.fuel >= 6;
+    this.rocketMat.fuelY.value = r.fuel > 0 ? bottom + 8 * r.fuel : -1e3;
+    const flashOn = full && this.game.timer >> 3 & 1;
+    this.rocketMat.fuel.value.setHex(flashOn ? 16777215 : 16711935);
+    if (r.state !== "pad") {
+      const frame2 = this.game.timer >> 2 & 1;
+      this.flames.set(this.lib.flame(frame2), material(16726544), r.x, BOTTOM(y + 21), 0);
+    } else this.flames.hide();
+  }
+  itemGeometry(it) {
+    const r = this.game.rocket;
+    if (it.kind === "pod") {
+      return { geo: this.lib.item("fuelPod"), mat: material(16711935), h: 11 };
+    }
+    if (it.kind === "top") return { geo: this.lib.rocket(r.model, "top"), mat: this.rocketMat.material, h: 16 };
+    if (it.kind === "mid") return { geo: this.lib.rocket(r.model, "middle"), mat: this.rocketMat.material, h: 16 };
+    const name = COLLECTIBLE_SPRITES[it.sprite] ?? "goldBar";
+    const t = this.game.timer;
+    let colour = 16776960;
+    if (name === "plutonium") colour = 65280;
+    else if (name === "radiation" || name === "chemical") colour = t & 16 ? 65535 : 682632;
+    else if (name === "diamond") colour = attrColour(1 + ((t >> 2) % 7 | 0));
+    return { geo: this.lib.item(name), mat: material(colour), h: SpriteLibrary.itemHeight(name) };
+  }
+  syncItems(alpha) {
+    const slots = [
+      [this.game.pod, this.pod],
+      [this.game.item, this.item]
+    ];
+    for (const [it, view2] of slots) {
+      if (!it) {
+        view2.hide();
+        continue;
+      }
+      const x = lerpWrap(it.px, it.x, alpha);
+      let y = lerpWrap(it.py, it.y, alpha);
+      const { geo, mat } = this.itemGeometry(it);
+      let z = 0;
+      if (it.carried && !it.delivering) {
+        y += 9;
+        z = 5;
+      }
+      view2.set(geo, mat, x, BOTTOM(y), z);
+    }
+  }
+  syncAliens(alpha) {
+    this.game.aliens.forEach((a, i) => {
+      const view2 = this.aliens[i];
+      if (!a || a.exploding) {
+        view2.hide();
+        return;
+      }
+      const x = lerpWrap(a.px, a.x, alpha);
+      const y = lerpWrap(a.py, a.y, alpha);
+      const frame2 = (Math.floor(a.x) & 4) !== 0 ? 1 : 0;
+      const facingLeft = a.left;
+      const geo = this.lib.alien(a.kind, frame2, facingLeft);
+      view2.set(geo, material(SPECTRUM_BRIGHT[a.colour & 7] || 16711680), x, BOTTOM(y), 0);
+    });
+  }
+  syncLasers(alpha) {
+    const lasers = this.game.lasers;
+    let used = 0;
+    for (const l of lasers) {
+      const head = l.px + (l.head - l.px) * alpha;
+      const lo = Math.min(head, l.tail);
+      const hi = Math.max(head, l.tail);
+      const len = Math.max(2, hi - lo);
+      const colour = SPECTRUM_BRIGHT[l.colour & 7];
+      for (const off of [-SCREEN_W, 0, SCREEN_W]) {
+        const mesh = this.laserMeshes[used++];
+        if (!mesh) return;
+        const cx = (lo + hi) / 2 + off;
+        mesh.visible = cx + len / 2 > -8 && cx - len / 2 < SCREEN_W + 8;
+        mesh.position.set(cx, BOTTOM(l.y), 0);
+        mesh.scale.set(len, 1, 1);
+        mesh.material.color.setHex(colour);
+      }
+    }
+    for (; used < this.laserMeshes.length; used++) this.laserMeshes[used].visible = false;
+  }
+  syncBooms() {
+    for (const b of this.game.booms) {
+      if (this.seenBooms.has(b)) continue;
+      this.seenBooms.add(b);
+      const palette = [16724e3, 16711935, 16769088, 16777215, SPECTRUM_BRIGHT[b.colour & 7] || 16777215];
+      const count = b.big ? 160 : 55;
+      const speed = b.big ? 90 : 55;
+      this.particles.burst(b.x + 8, BOTTOM(b.y) + (b.big ? 12 : 7), count, speed, palette);
+    }
+  }
+  emitThrust(dt) {
+    const j = this.game.jetman;
+    if (!(j.active && j.mode === "fly" && j.thrusting)) return;
+    this.emitAcc += dt * 90;
+    while (this.emitAcc >= 1) {
+      this.emitAcc -= 1;
+      const x = j.x + (j.faceLeft ? 11 : 5) + (Math.random() - 0.5) * 3;
+      const y = BOTTOM(j.y) + 6;
+      this.particles.spawn(x, y, (Math.random() - 0.5) * 8, -40 - Math.random() * 30, 0.35, 16751136, 1.1);
+    }
+  }
+  updateCamera(_dt) {
+    const cx = this.focus ? this.focus.x : SCREEN_W / 2;
+    const cy = this.focus ? BOTTOM(this.focus.y) : SCREEN_H / 2 - 4;
+    this.camera.position.set(cx, cy, this.fitDistance());
+    this.camera.lookAt(cx, cy, 0);
+  }
+};
+
+// src/audio/beeper.ts
+var CPU_HZ = 35e5;
+function squareWaveSegments(d, c, silentStart) {
+  const delay = d === 0 ? 256 : d;
+  const segs = [];
+  if (silentStart) segs.push([0, 13 * delay + 33]);
+  for (let i = 0; i < c; i++) {
+    segs.push([1, 13 * delay + 14]);
+    segs.push([0, 13 * delay + 33]);
+  }
+  return segs;
+}
+function laserSegments() {
+  const segs = [];
+  for (let c = 8; c < 56; c++) {
+    segs.push([1, 13 * c + 14]);
+    segs.push([0, 13 * c + 44]);
+  }
+  return segs;
+}
+function explosionSegments(c0) {
+  const segs = [];
+  for (let c = c0; c >= 1; c--) {
+    segs.push([1, 13 * c + 14]);
+    segs.push([0, 13 * c + 33]);
+  }
+  return segs;
+}
+function segmentsDuration(segs) {
+  let t = 0;
+  for (const s of segs) t += s[1];
+  return t / CPU_HZ;
+}
+function renderSegments(segs, sampleRate) {
+  const total = Math.ceil(segmentsDuration(segs) * sampleRate) + 1;
+  const out = new Float32Array(total);
+  let t = 0;
+  for (const [level, ts] of segs) {
+    const t1 = t + ts / CPU_HZ * sampleRate;
+    if (level) {
+      let i = Math.floor(t);
+      while (i < t1 && i < total) {
+        const overlap = Math.min(i + 1, t1) - Math.max(i, t);
+        if (overlap > 0) out[i] += overlap;
+        i++;
+      }
+    }
+    t = t1;
+  }
+  return out;
+}
+var Beeper = class {
+  ctx = null;
+  master = null;
+  cache = /* @__PURE__ */ new Map();
+  volume = 0.3;
+  /** Must be called from a user gesture (key press / click). */
+  unlock() {
+    if (!this.ctx) {
+      const Ctor = window.AudioContext ?? window.webkitAudioContext;
+      this.ctx = new Ctor();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = this.volume;
+      this.master.connect(this.ctx.destination);
+    }
+    if (this.ctx.state === "suspended") void this.ctx.resume();
+  }
+  setVolume(v) {
+    this.volume = v;
+    if (this.master) this.master.gain.value = v;
+  }
+  play(e) {
+    if (!this.ctx || !this.master) return;
+    let key;
+    let segs;
+    switch (e.t) {
+      case "laser":
+        key = "laser";
+        segs = laserSegments;
+        break;
+      case "square":
+        key = `sq${e.d}:${e.c}:${e.silentStart ? 1 : 0}`;
+        segs = () => squareWaveSegments(e.d, e.c, e.silentStart);
+        break;
+      case "explode":
+        key = `ex${e.c}`;
+        segs = () => explosionSegments(e.c);
+        break;
+    }
+    let buf = this.cache.get(key);
+    if (!buf) {
+      const data = renderSegments(segs(), this.ctx.sampleRate);
+      buf = this.ctx.createBuffer(1, data.length, this.ctx.sampleRate);
+      const ch = buf.getChannelData(0);
+      for (let i = 0; i < data.length; i++) ch[i] = (Math.min(1, data[i]) - 0.5) * 2;
+      this.cache.set(key, buf);
+    }
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(this.master);
+    src.start();
+  }
+};
+
+// src/ui/spectrumFont.ts
+var glyphs = sprites_default.font;
+var glyphFor = (ch) => {
+  let code = ch.toUpperCase().charCodeAt(0);
+  if (ch === "\xA9") code = 91;
+  return glyphs[code - 32] ?? glyphs[0];
+};
+function drawSpectrumText(canvas2, segments, scale) {
+  const chars = segments.reduce((n, s) => n + s[0].length, 0);
+  const w = Math.max(1, chars * 8 * scale);
+  const h = 8 * scale;
+  if (canvas2.width !== w) canvas2.width = w;
+  if (canvas2.height !== h) canvas2.height = h;
+  const ctx = canvas2.getContext("2d");
+  ctx.clearRect(0, 0, w, h);
+  let x = 0;
+  for (const [text, colour] of segments) {
+    ctx.fillStyle = colour;
+    for (const ch of text) {
+      const g = glyphFor(ch);
+      for (let row = 0; row < 8; row++) {
+        const bits = g[row];
+        for (let col = 0; col < 8; col++) {
+          if (bits >> 7 - col & 1) ctx.fillRect(x + col * scale, row * scale, scale, scale);
+        }
+      }
+      x += 8 * scale;
+    }
+  }
+}
+var ZxText = class {
+  constructor(className, scale = 3) {
+    this.scale = scale;
+    this.el.className = `zx ${className}`;
+  }
+  scale;
+  el = document.createElement("canvas");
+  last = "";
+  set(segments, scale = this.scale) {
+    const key = scale + "|" + segments.map((s) => s[1] + s[0]).join("");
+    if (key === this.last) return;
+    this.last = key;
+    drawSpectrumText(this.el, segments, scale);
+  }
+};
+
+// src/ui/hud.ts
+var YELLOW = "#ffe84a";
+var WHITE = "#ffffff";
+var CYAN = "#7df9ff";
+var MAGENTA = "#ff5cff";
+var six = (n) => String(n).padStart(6, "0");
+var Hud = class {
+  constructor(root) {
+    this.root = root;
+    const bar = document.createElement("div");
+    bar.id = "hud";
+    for (const [cls, z] of [["left", this.score], ["mid", this.hi], ["right", this.stats]]) {
+      const cell = document.createElement("div");
+      cell.className = `cell ${cls}`;
+      cell.append(z.el);
+      bar.append(cell);
+    }
+    root.append(bar);
+    this.banner.id = "banner";
+    this.banner.append(this.title.el, this.sub.el, this.prompt.el);
+    const keys2 = document.createElement("div");
+    keys2.className = "banner-keys-box";
+    for (const k of this.keys) keys2.append(k.el);
+    this.banner.append(keys2);
+    root.append(this.banner);
+    this.toastBox.id = "toast";
+    this.toastBox.append(this.toastText.el);
+    root.append(this.toastBox);
+  }
+  root;
+  score = new ZxText("hud-score");
+  hi = new ZxText("hud-hi");
+  stats = new ZxText("hud-stats");
+  title = new ZxText("banner-title");
+  sub = new ZxText("banner-sub");
+  prompt = new ZxText("banner-prompt");
+  keys = [new ZxText("banner-keys"), new ZxText("banner-keys"), new ZxText("banner-keys")];
+  toastText = new ZxText("toast-text");
+  banner = document.createElement("div");
+  toastBox = document.createElement("div");
+  toastTimer = 0;
+  /** Font scale (pixels per font pixel) so the text keeps the same proportions at any window size. */
+  px(divisor) {
+    return Math.max(1, Math.floor(this.root.clientWidth / divisor));
+  }
+  toast(text) {
+    this.toastText.set([[text, "#b8c4ff"]], this.px(533));
+    this.toastBox.style.opacity = "1";
+    clearTimeout(this.toastTimer);
+    this.toastTimer = window.setTimeout(() => this.toastBox.style.opacity = "0", 1500);
+  }
+  update(game2) {
+    const hudScale = this.px(360);
+    this.score.set([["1UP ", YELLOW], [six(game2.score), WHITE]], hudScale);
+    this.hi.set([["HI ", YELLOW], [six(game2.hiScore), WHITE]], hudScale);
+    this.stats.set(
+      [
+        ["LIVES ", YELLOW],
+        [String(Math.max(0, game2.lives)), WHITE],
+        [" LEVEL ", YELLOW],
+        [String(game2.level + 1), WHITE]
+      ],
+      hudScale
+    );
+    const showBanner = game2.phase !== "playing";
+    this.banner.classList.toggle("visible", showBanner);
+    if (!showBanner) return;
+    if (game2.phase === "gameover") {
+      this.title.set([["GAME OVER", MAGENTA]], this.px(100));
+      this.sub.set([["SCORE " + six(game2.score), CYAN]], this.px(266));
+      this.prompt.set([["PRESS ENTER OR SPACE", YELLOW]], this.px(355));
+    } else {
+      this.title.set([["JETPAC", WHITE]], this.px(66));
+      this.sub.set([["3D REMAKE", CYAN]], this.px(266));
+      this.prompt.set([["PRESS ENTER OR SPACE TO START", YELLOW]], this.px(355));
+    }
+    const k = this.px(533);
+    this.keys[0].set([["ARROWS WASD ZX MOVE   UP W Q THRUST   SPACE F FIRE", "#b8c4ff"]], k);
+    this.keys[1].set([["P PAUSE   M MUTE", "#b8c4ff"]], k);
+    this.keys[2].set([["", "#b8c4ff"]], k);
+  }
+};
+
+// src/main.ts
+var canvas = document.getElementById("game");
+var game = new Game();
+var view = new GameView(canvas, game);
+view.prewarm();
+var keys = new Keyboard();
+var beeper = new Beeper();
+var hud = new Hud(document.getElementById("ui"));
+game.onSfx = (e) => beeper.play(e);
+canvas.tabIndex = 0;
+canvas.focus();
+window.addEventListener("pointerdown", () => canvas.focus());
+try {
+  game.hiScore = Number(localStorage.getItem("jetpac3d.hi") ?? 0) || 0;
+} catch {
+}
+var savedHi = game.hiScore;
+var paused = false;
+var muted = false;
+var MAX_STEPS_PER_FRAME = 24;
+var acc = 0;
+var last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.25, (now - last) / 1e3);
+  last = now;
+  if (keys.consume("KeyM")) {
+    muted = !muted;
+    beeper.setVolume(muted ? 0 : 0.3);
+    hud.toast(muted ? "SOUND OFF" : "SOUND ON");
+  }
+  if (keys.consume("KeyP") && game.phase === "playing") {
+    paused = !paused;
+    hud.toast(paused ? "PAUSED" : "RESUMED");
+  }
+  if (game.phase !== "playing" && keys.consume("Enter", "Space")) {
+    beeper.unlock();
+    game.startGame();
+    paused = false;
+  } else if (keys.consume("Enter", "Space", "ArrowUp", "ArrowLeft", "ArrowRight")) {
+    beeper.unlock();
+  }
+  if (!paused) {
+    acc += dt;
+    let steps = 0;
+    while (acc >= STEP && steps < MAX_STEPS_PER_FRAME) {
+      game.update(keys.sample());
+      acc -= STEP;
+      steps++;
+    }
+    if (steps === MAX_STEPS_PER_FRAME) acc = 0;
+  }
+  view.render(paused ? 1 : acc / STEP, dt);
+  hud.update(game);
+  if (game.hiScore !== savedHi && game.phase !== "playing") {
+    savedHi = game.hiScore;
+    try {
+      localStorage.setItem("jetpac3d.hi", String(savedHi));
+    } catch {
+    }
+  }
+  keys.endFrame();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+Object.assign(window, { game, view });
+
+    </script>
+  </body>
+</html>
